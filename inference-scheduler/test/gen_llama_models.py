@@ -74,6 +74,22 @@ def tiny_weights(cfg: dict, seed: int = 0) -> dict:
     return W
 
 
+def tiny_gemma_weights(cfg: dict, seed: int = 0) -> dict:
+    """tiny_weights under Gemma 3's names: four RMSNorms per layer and the q / k head
+    norms, every norm weight stored as w - 1 (the block multiplies by 1 + w)."""
+    W = tiny_weights(cfg, seed)
+    rng = np.random.default_rng(seed + 100)
+    D, HD = cfg["hidden_size"], cfg["head_dim"]
+    W["model.norm.weight"] = bf16(rng.normal(0, 0.2, D))
+    for l in range(cfg["num_hidden_layers"]):
+        pre = f"model.layers.{l}."
+        for name, n in (("input_layernorm", D), ("post_attention_layernorm", D),
+                        ("pre_feedforward_layernorm", D), ("post_feedforward_layernorm", D),
+                        ("self_attn.q_norm", HD), ("self_attn.k_norm", HD)):
+            W[pre + name + ".weight"] = bf16(rng.normal(0, 0.2, n))
+    return W
+
+
 def study_cfg(cfg: dict):
     """llm_study.Cfg for an in-memory config dict."""
     return study.Cfg.from_dict(cfg)
@@ -87,7 +103,7 @@ def calibrate(cfg: dict, W: dict, policy: str = POLICY, seed: int = 1, n_seq: in
     sc = study_cfg(cfg)
     rng = np.random.default_rng(seed)
     calib = [np.concatenate([[1], rng.integers(2, sc.V, length - 1)]) for _ in range(n_seq)]
-    pol = study.POLICIES[policy]
+    pol = study.policy_spec(policy)
     fm = study.Model(W, sc, None)
     cm = study.Model(W, sc, None, base=fm, sink=True, sink_model=fm, record_ch=True)
     for c in calib:
@@ -116,16 +132,16 @@ def study_model(cfg: dict, W: dict, formats: dict, policy: str = POLICY):
         cls_, l = k.split("@")
         fmt[(cls_, int(l))] = v if isinstance(v, int) else np.asarray(v, np.int64)
     fm = study.Model(W, sc, None)
-    return study.Model(W, sc, study.POLICIES[policy], fmt, sink_model=fm), sc
+    return study.Model(W, sc, study.policy_spec(policy), fmt, sink_model=fm), sc
 
 
 def frontend(cfg: dict, W: dict, formats: dict, ctx: int = TINY_CTX, name: str = "llama_tiny",
              prefill_attn: str = "fpga", decode_attn: str = "host", vsmx: bool = False,
-             rowops: bool = False, drope: bool = False):
+             rowops: bool = False, drope: bool = False, **kw):
     lc = LlamaConfig.from_dict(cfg)
     return LlamaFrontend(lc, W, Formats(formats, lc), ctx=ctx, name=name,
                          prefill_attn=prefill_attn, decode_attn=decode_attn, vsmx=vsmx, rowops=rowops,
-                         drope=drope)
+                         drope=drope, **kw)
 
 
 def tiny(seed: int = 0):

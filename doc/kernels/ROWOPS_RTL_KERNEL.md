@@ -132,7 +132,7 @@ every counter is sized for the register value.
 | host op today | unit jobs |
 |---|---|
 | `LlmResAddNode`, `VitResAddNode` | ADDX (A h i32, B d i16, `P_BCAST` or per-column bias) |
-| `LlmRMSNormNode`, `VitLayerNormNode`, `LayerNormNode` (BERT), `TtsResNormNode` | NORM (TtsResNorm: ADDX into an i32 row, then NORM) |
+| `LlmRMSNormNode`, `VitLayerNormNode`, `LayerNormNode` (BERT), `TtsResNormNode` | NORM (TtsResNorm: ADDX into an i32 row, then NORM; Gemma 3's norms of int16 kernel outputs — the attention / MLP outputs, the q / k heads as rows of `head_dim` — `LlmWiden`'s COPY into an i32 row at the finest channel exponent, then NORM; CHAT_PLAN §31) |
 | `LlmSiluMulNode` | MULACT |
 | `LlmDequantNode` (`DequantRoNode`, RPU_PLAN A1: the output a float32 DMA tensor or state, `dma: f32`) | DEQUANT (A i16 at per-column exponents, or the int32 residual) |
 | `VitSumDequantNode` (RPU_PLAN A1, the vision frontend's `rowops`) | the parts summed by ADDX into an int32 row at the finest part exponent (`ResAddBiasRoNode` with a zero bias, then `ResAddRoNode`), DEQUANT into the float32 image-feature state |

@@ -373,23 +373,49 @@ class Smollm2Backend(Backend):
             raise RuntimeError(f"the library's sink token is {self.lib_sink}, the tokenizer's prompts "
                                f"start with {self.bos}: a library generated for another checkpoint")
         self.tok = tok
-        self.sampler = make_sampler(self.tok.vocab_size, self.sampler_lib)
-        self._set_breakers(self.dry_breakers)
+        self._make_sampler()
         return tok
+
+    def _make_sampler(self) -> None:
+        self.sampler = make_sampler(self.n_vocab, self.sampler_lib)
+        self._sampler_n = self.n_vocab
+        self._breakers_set = None
+        self._set_breakers(self.dry_breakers)
 
     def _check_vocab(self, lib_vocab: int, tok) -> None:
         """The library may have more vocabulary rows than the tokenizer has
         tokens (Qwen2.5 and Phi-3 pad their embeddings; the rows past the
-        tokenizer's are never sampled: _vocab_logits), not fewer."""
+        tokenizer's are never sampled: _vocab_logits), or fewer where every
+        tokenizer id past its rows is an added special token the model has no
+        row for (Gemma 3's <image_soft_token>: never sampled, refused in a
+        prompt — n_vocab)."""
         if lib_vocab < tok.vocab_size:
-            raise RuntimeError(f"the library's vocabulary ({lib_vocab}) is smaller than the "
-                               f"tokenizer's ({tok.vocab_size})")
+            extra = [i for i in range(max(lib_vocab, 0), tok.vocab_size) if not tok.is_special(i)]
+            if extra or lib_vocab <= 0:
+                raise RuntimeError(f"the library's vocabulary ({lib_vocab}) is smaller than the "
+                                   f"tokenizer's ({tok.vocab_size}), and not by special tokens only")
+        self.lib_vocab = lib_vocab
+
+    @property
+    def n_vocab(self) -> int:
+        """The ids the model scores: the tokenizer's, at most the library's rows."""
+        n = self.tok.vocab_size
+        return min(n, self.lib_vocab) if self.lib_vocab else n
+
+    def _check_ids(self, ids, field: str = "messages") -> None:
+        """A prompt's ids must have embedding rows (an added special token past the
+        library's vocabulary has none)."""
+        bad = [int(i) for i in ids if int(i) >= self.n_vocab]
+        if bad:
+            raise BackendError(f"the prompt holds token id {bad[0]} ({self.tok.token_bytes(bad[0])!r}), "
+                               f"which this model has no row for (vocabulary {self.n_vocab}).", field,
+                               code="invalid_value")
 
     def _vocab_logits(self, logits):
         """The logits of the tokenizer's vocabulary: a library with padded
         embedding rows returns more, which are never sampled or reported (a
         view of a ctypes array, no copy)."""
-        n = self.tok.vocab_size
+        n = self.n_vocab
         if len(logits) == n:
             return logits
         if isinstance(logits, ctypes.Array):
@@ -403,7 +429,7 @@ class Smollm2Backend(Backend):
         ids = self._breaker_ids.get(breakers)
         if ids is None:
             pats = [b.encode("utf-8") for b in breakers if b]
-            ids = [i for i in range(self.tok.vocab_size)
+            ids = [i for i in range(self.n_vocab)
                    if self.tok.is_special(i) or any(pt in self.tok.token_bytes(i) for pt in pats)]
             if len(self._breaker_ids) > 8:
                 self._breaker_ids.clear()
@@ -423,6 +449,8 @@ class Smollm2Backend(Backend):
         except RuntimeError:
             self.engine.close()
             raise
+        if self.sampler is not None and self._sampler_n != self.n_vocab:   # sizes known only now
+            self._make_sampler()
         self.ctx = self.engine.context_size
         self._cached = None
 
@@ -518,6 +546,7 @@ class Smollm2Backend(Backend):
         if not ids or ids[0] != self.bos or len(ids) < 2:
             raise BackendError(f"internal: the chat template must start with the sink token {self.bos}",
                                "messages")
+        self._check_ids(ids)
         seed = req.seed if req.seed is not None else random.SystemRandom().getrandbits(63)
         job = Job(req, ids, params, seed, req.max_tokens, list(req.stop), last_n, dry_n,
                   breakers, loop_guard, dropped, (time.monotonic() - t0) * 1000.0)
@@ -550,7 +579,7 @@ class Smollm2Backend(Backend):
         """OpenAI's logprobs content entry of token t from the step's logits (the
         model's distribution, before the sampler's penalties)."""
         import numpy as np
-        x = logits[:self.tok.vocab_size]
+        x = logits[:self.n_vocab]
         m = x.max()
         lp = x - (m + np.log(np.exp(x - m).sum()))
 

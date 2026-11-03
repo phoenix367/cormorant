@@ -227,7 +227,7 @@ src/
   vectorop_smx.py, smx_nodes.py
                          VectorOPKernel's softmax (ops 10 / 11): its integer specification; its nodes
   llm_nodes.py           axi.llm ops (LlmEmbed, LlmRMSNorm, LlmResAdd, LlmAttention,
-                         LlmSiluMul, LlmSelectRow, LlmDequant, LlmToHost, LlmAttnPrep /
+                         LlmSiluMul, LlmGeluMul, LlmSelectRow, LlmDequant, LlmToHost, LlmAttnPrep /
                          LlmAttnSoftmax / LlmAttnMerge) + LlmAttnConvNode (FPGA q·Kᵀ / P·V;
                          static keys for the vision encoder)
   graph_builder.py       the frontends' shared plumbing (GraphBuilder: an entry graph's tensors with
@@ -354,7 +354,7 @@ test/
                          VectorOP / Matmul / Conv / RowOps kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              93 pytest modules, 1927 tests, all pass (test_bert_base.py
+  test_*.py              93 pytest modules, 1934 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

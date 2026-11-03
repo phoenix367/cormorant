@@ -112,11 +112,12 @@ class GraphBuilder:
         self._nodes.append(oh.make_node(op, ins, outs, name=name,
                                         domain=self.NODE_DOMAIN if domain is None else domain, **attrs))
 
-    def _residual(self, name, rows, width, dma=True, state=False):
+    def _residual(self, name, rows, width, dma=True, state=False, bits=RES_BITS):
         """A residual-stream tensor [rows][width]: the int32 DMA tensor at
-        2^-RES_BITS (the row-ops unit's adds, exact), else float32 host memory."""
+        2^-bits (the row-ops unit's adds, exact; RES_BITS unless a model's residual
+        needs a coarser grid), else float32 host memory."""
         if dma:
-            return self._t(name, [rows, width], exp=RES_BITS, dma="i32", state=state)
+            return self._t(name, [rows, width], exp=bits, dma="i32", state=state)
         return self._t(name, [rows, width], host="f32", state=state)
 
     def _matmul(self, x, wname, W, T, y, exp, name):

@@ -14,7 +14,7 @@ from ..nodes    import (ACT_NAMES, OP_NAMES, OP_SOFTMAX, ConvNode, MatmulConvNod
 from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, ConcatNode, HostNode,
                           SliceNode, host_c_helper)
 from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmKernelNode, LlmNode,
-                         llm_c_helpers)
+                         llm_c_helpers, llm_ext_c_helpers)
 from ..vit_nodes import vit_c_helpers
 from ..tts_nodes import tts_c_helpers
 from ..stereo_nodes import stereo_c_helpers
@@ -303,6 +303,8 @@ class _SourceMixin:
                 parts.append(host_c_helper(kind, lut))
         if "llm" in used:
             parts.append(llm_c_helpers())
+            if "llm_ext" in used:
+                parts.append(llm_ext_c_helpers())
             if self._dma_states:
                 parts.append(LLM_C_DMA)
         if "vit" in used:

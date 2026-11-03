@@ -66,39 +66,70 @@ def rowops_default() -> bool:
     return enabled()
 
 
-def drope_default(rowops: Optional[bool] = None) -> bool:
+def unit_prep(cfg=None) -> bool:
+    """The attention prep can run on the row-ops unit: its ROPE takes heads of at most
+    128 dims (Gemma 3's 256: the prep stays on the host, policy ...+rowops+hprep)."""
+    return cfg is None or cfg.HD <= 128
+
+
+def drope_default(rowops: Optional[bool] = None, cfg=None) -> bool:
     """The decode steps' attention prep on the row-ops unit too (RPU_PLAN §13.4,
     policy ...+rowops+drope: every step's RoPE the integer one) where the
     project uses the unit and the unit runs descriptor chains (one chain per
-    layer; issued job by job it would cost the CPU what the host prep does)."""
+    layer; issued job by job it would cost the CPU what the host prep does),
+    and the model's heads fit the unit's ROPE (``unit_prep``)."""
     from src.rowops_nodes import chains_enabled
     rowops = rowops_default() if rowops is None else rowops
-    return bool(rowops) and chains_enabled()
+    return bool(rowops) and chains_enabled() and unit_prep(cfg)
+
+
+FORMATS_POLICY = "pow2+sink+p12"        # their exponents (both use the p12 formats)
+MANIFEST = os.path.join(HERE, "llm_models.json")
+
+
+def formats_policy(assets: Optional[str] = None) -> str:
+    """The model's calibration policy: llm_models.json models.<name>.formats.policy
+    (llm_calibrate.py), FORMATS_POLICY for a model the manifest does not pin."""
+    try:
+        with open(MANIFEST) as f:
+            spec = json.load(f)["models"].get(llm_model.model_name(assets or default_assets()), {})
+    except (OSError, KeyError, ValueError):
+        spec = {}
+    return (spec.get("formats") or {}).get("policy") or FORMATS_POLICY
 
 
 def policy(prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN,
            vsmx: Optional[bool] = None, rowops: Optional[bool] = None,
-           drope: Optional[bool] = None) -> str:
+           drope: Optional[bool] = None, cfg=None, formats: str = FORMATS_POLICY) -> str:
     """The study policy a project of these attention modes computes (``vsmx`` /
     ``rowops`` / ``drope`` None: vsmx_default() / rowops_default() /
-    drope_default())."""
+    drope_default()); ``cfg``: the model's LlamaConfig (heads beyond the unit's
+    ROPE: +hprep), ``formats``: its calibration policy (formats_policy; another
+    than FORMATS_POLICY is the base of the FPGA attention's policy)."""
     if (prefill_attn, decode_attn) not in ATTN_POLICIES:
         raise ValueError(f"no policy for prefill attention {prefill_attn!r} with decode "
                          f"attention {decode_attn!r} (decode on the FPGA needs FPGA prefill)")
     base = ATTN_POLICIES[(prefill_attn, decode_attn)]
+    if formats != FORMATS_POLICY:
+        if (prefill_attn, decode_attn) != ("fpga", "fpga"):
+            raise ValueError(f"formats {formats!r}: studied with the FPGA attention in prefill and decode")
+        base = formats
     vsmx = vsmx_default() if vsmx is None else vsmx
     rowops = rowops_default() if rowops is None else rowops
-    drope = drope_default(rowops) if drope is None else drope
+    drope = drope_default(rowops, cfg) if drope is None else drope
     if (vsmx or rowops) and (prefill_attn, decode_attn) != ("fpga", "fpga"):
         raise ValueError("vsmx / rowops (the softmax and the row ops on the FPGA units) are studied "
                          "with the FPGA attention in prefill and decode only")
     if drope and not rowops:
         raise ValueError("drope (the decode prep on the row-ops unit) needs rowops")
-    return base + ("+vsmx" if vsmx else "") + ("+rowops" if rowops else "") + ("+drope" if drope else "")
+    hprep = bool(rowops) and not unit_prep(cfg)
+    if drope and hprep:
+        raise ValueError(f"drope: head_dim {cfg.HD} beyond the unit's ROPE segment (128)")
+    return (base + ("+vsmx" if vsmx else "") + ("+rowops" if rowops else "") + ("+drope" if drope else "")
+            + ("+hprep" if hprep else ""))
 
 
 POLICY = policy()
-FORMATS_POLICY = "pow2+sink+p12"        # their exponents (both use the p12 formats)
 CONTEXT = 1024                          # positions incl. the sink (CHAT_PLAN decision)
 BUCKETS = (16, 64, 256)                 # prefill entries (rows per call)
 
@@ -113,9 +144,18 @@ def gate_prompts(assets: Optional[str] = None) -> Tuple[str, str]:
     """(prompts, second-turn prompts) of the gates (llm_sched_check.py,
     llm_host_emu.py, llm_board.py): three chat prompts with a second turn on
     the first — a text profile's three story beginnings likewise."""
-    if llm_model.Profile(assets or default_assets()).chat:
-        return "factual,summarise,multi-turn", "factual"
+    assets = assets or default_assets()
+    if llm_model.Profile(assets).chat:
+        # a model with a sliding window: a prompt beyond it too (study.WINDOW_PROMPTS)
+        return "factual,summarise,multi-turn" + (",long-summary" if windowed(assets) else ""), "factual"
     return "dragon,long,dialogue", "dragon"
+
+
+def windowed(assets: Optional[str] = None) -> bool:
+    """The model has a sliding window shorter than its library's context."""
+    cfg = LlamaConfig.from_file(os.path.join(assets or default_assets(), "config.json"))
+    ctx = context(assets)
+    return any((w := cfg.layer_window(li)) is not None and w < ctx for li in range(cfg.L))
 
 
 def _main_checkout() -> str:
@@ -138,7 +178,7 @@ def default_assets() -> str:
 
 def default_formats(assets: Optional[str] = None) -> str:
     assets = assets or default_assets()
-    return os.path.join(study.study_dir(assets), f"formats_{FORMATS_POLICY}.json")
+    return os.path.join(study.study_dir(assets), f"formats_{formats_policy(assets)}.json")
 
 
 def load_model(assets: Optional[str] = None, formats: Optional[str] = None,
@@ -161,10 +201,11 @@ def frontend(cfg, W, fmt, ctx: int = CONTEXT, name: str = "smollm2",
              drope: Optional[bool] = None) -> LlamaFrontend:
     vsmx = vsmx_default() if vsmx is None else vsmx
     rowops = rowops_default() if rowops is None else rowops
-    drope = drope_default(rowops) if drope is None else drope
-    policy(prefill_attn, decode_attn, vsmx, rowops, drope)      # a studied combination
+    drope = drope_default(rowops, cfg) if drope is None else drope
+    policy(prefill_attn, decode_attn, vsmx, rowops, drope, cfg)  # a studied combination
     return LlamaFrontend(cfg, W, fmt, ctx=ctx, name=name, prefill_attn=prefill_attn,
-                         decode_attn=decode_attn, vsmx=vsmx, rowops=rowops, drope=drope)
+                         decode_attn=decode_attn, vsmx=vsmx, rowops=rowops, drope=drope,
+                         uprep=bool(rowops) and unit_prep(cfg))
 
 
 def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> EntryModels:
@@ -307,14 +348,14 @@ class SimSession:
         return out["decode.logits"].reshape(-1)
 
 
-def _cached_ids(assets: Optional[str], cache: Optional[str], name: str, expr: str):
+def _cached_ids(assets: Optional[str], cache: Optional[str], name: str, expr: str, refresh: bool = False):
     """Token ids the study computes with the model's own tokenizer (``expr``
     over ``t`` = llm_study.Tok and ``p`` = llm_study.Profile of the assets), in
     .venv-export's tokenizers (subprocess) once, cached as JSON in the model's
-    study directory."""
+    study directory (``refresh``: computed again)."""
     assets = os.path.abspath(assets or default_assets())
     cache = cache or os.path.join(study.study_dir(assets), name)
-    if not os.path.exists(cache):
+    if refresh or not os.path.exists(cache):
         code = ("import json, sys; sys.path.insert(0, %r); import llm_study as s; "
                 "a = %r; t = s.Tok(a); p = s.Profile(a); json.dump(%s, open(%r, 'w'))"
                 % (HERE, assets, expr, cache))
@@ -350,8 +391,10 @@ def tokenize_prompts(names: Optional[Sequence[str]] = None, cache: Optional[str]
     """Token ids of the model's study prompts (llm_study.Profile.prompt_ids:
     PROMPTS in the chat template, from the sink on; a text profile's
     STORY_PROMPTS after the BOS), with its own tokenizer."""
-    ids = _cached_ids(assets, cache, "prompt_ids.json",
-                      "{n: [int(i) for i in p.prompt_ids(t, m)] for n, m in p.prompts}")
+    expr = "{n: [int(i) for i in p.prompt_ids(t, m)] for n, m in list(p.prompts) + list(p.gate_extra)}"
+    ids = _cached_ids(assets, cache, "prompt_ids.json", expr)
+    if names and any(n not in ids for n in names):            # a cache from before a gate-only prompt
+        ids = _cached_ids(assets, cache, "prompt_ids.json", expr, refresh=True)
     if names:
         ids = {n: ids[n] for n in names}
     return ids

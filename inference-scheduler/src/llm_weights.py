@@ -13,14 +13,24 @@ compute the same block from the same numbers.  numpy only.
   attention factor    yarn / longrope's factor on cos and sin: factor² on the
                       rotated rows of W_q
   attention_multiplier  the score scale instead of head_dim^-0.5: the ratio on W_q
+                        (with q / k head norms on the q norm's weight: the norm would
+                        undo a scale of W_q; Gemma's query_pre_attn_scalar likewise)
   residual_multiplier   on W_o and W_down (the two residual branches)
-  embedding_multiplier  on the embedding table (not on a tied LM head)
   logits_scaling        1 / it on the LM head
+  (1 + w) norms         Gemma's RMSNorm weights stored as w - 1: 1 + w (float32)
+  Gemma's norm names    pre_feedforward_layernorm is the plain block's
+                        post_attention_layernorm (before the MLP); its
+                        post_attention_layernorm / post_feedforward_layernorm,
+                        the norms of the attention / MLP outputs, are attn_out_norm /
+                        mlp_out_norm here; q_norm / k_norm (Gemma 3, Qwen3) keep theirs
   the LM head         lm_head.weight, or the embedding when tied (a stored
                       lm_head of a tied checkpoint is ignored, as Hugging Face does)
 
-A plain model (LlamaConfig.plain) reads every tensor unchanged: the same
-arrays as before, so its libraries regenerate byte-identical.  Transforms are
+The embedding multiplier (Granite's, Gemma's sqrt(hidden)) is not folded into
+the table: the lookup multiplies in float32, as Hugging Face does, and a bf16
+table stays bf16 (LlmEmbed's ``scale``).  A plain model (LlamaConfig.plain)
+reads every tensor unchanged: the same arrays as before, so its libraries
+regenerate byte-identical.  Transforms are
 applied in float64 and rounded once to float32.  Reads go through to the
 checkpoint view, whose record of the tensors read (src/checkpoint.py) stays
 the one check_consumed looks at.
@@ -29,7 +39,7 @@ the one check_consumed looks at.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Iterator
+from typing import Dict, Iterator, Optional
 
 import numpy as np
 
@@ -49,6 +59,13 @@ except ImportError:                     # loaded by path (llm_study): the siblin
 LAYER = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
          "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm",
          "post_attention_layernorm")
+QK_NORMS = ("self_attn.q_norm", "self_attn.k_norm")            # cfg.qk_norm: [HD] per head
+POST_NORMS = ("attn_out_norm", "mlp_out_norm")                 # cfg.post_norms: [D]
+# the plain names of a post-norm (Gemma 2 / 3) checkpoint's norms
+POST_NORM_SOURCE = {"post_attention_layernorm": "pre_feedforward_layernorm",
+                    "attn_out_norm": "post_attention_layernorm",
+                    "mlp_out_norm": "post_feedforward_layernorm"}
+NORMS = ("input_layernorm", "post_attention_layernorm") + QK_NORMS + POST_NORMS
 
 # The block's linears: (key, tensor name in the layer, input class, output class) —
 # the classes are the formats' (llm_study.py calibrates them, src/llama.py reads them)
@@ -58,10 +75,32 @@ LINEARS = (("q", "self_attn.q_proj", "x", "q0"), ("k", "self_attn.k_proj", "x", 
            ("d", "mlp.down_proj", "a", "d"))
 
 
-def rope_spec(cfg) -> "rope.RopeSpec":
-    """The RoPE of a LlamaConfig (or the study's Cfg)."""
+def rope_spec(cfg, layer: Optional[int] = None) -> "rope.RopeSpec":
+    """The RoPE of a LlamaConfig (or the study's Cfg); with ``layer``, that layer's —
+    a sliding layer's own theta, unscaled (Gemma 3's rope_local_base_freq)."""
+    if layer is not None and _local(cfg, layer):
+        return rope.RopeSpec(cfg.HD, cfg.local_theta, getattr(cfg, "rot", 0), None, getattr(cfg, "max_pos", 0))
     return rope.RopeSpec(cfg.HD, cfg.theta, getattr(cfg, "rot", 0),
                          getattr(cfg, "rope_scaling", None), getattr(cfg, "max_pos", 0))
+
+
+def _local(cfg, li: int) -> bool:
+    lt = getattr(cfg, "layer_types", None)
+    return getattr(cfg, "local_theta", None) is not None and lt is not None and lt[li] == "sliding"
+
+
+def rope_kinds(cfg) -> Dict[str, Optional[int]]:
+    """{"global": None, "local": a sliding layer}: the RoPE tables a model needs
+    ("local" only when its sliding layers rotate with their own theta)."""
+    out: Dict[str, Optional[int]] = {"global": None}
+    loc = [li for li in range(cfg.L) if _local(cfg, li)]
+    if loc:
+        out["local"] = loc[0]
+    return out
+
+
+def rope_kind(cfg, li: int) -> str:
+    return "local" if _local(cfg, li) else "global"
 
 
 class Prepared(Mapping):
@@ -88,8 +127,12 @@ class Prepared(Mapping):
         if getattr(cfg, "attn_mult", None) is not None:
             q *= cfg.attn_mult * np.sqrt(hd)
         self.q_scale = None if (q == 1.0).all() else q
+        self.qk_norm = bool(getattr(cfg, "qk_norm", False))
+        self.post_norms = bool(getattr(cfg, "post_norms", False))
+        self.norm_offset = bool(getattr(cfg, "norm_offset", False))
+        layer = LAYER + (QK_NORMS if self.qk_norm else ()) + (POST_NORMS if self.post_norms else ())
         self._names = (["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
-                       + [f"model.layers.{li}.{n}.weight" for li in range(cfg.L) for n in LAYER])
+                       + [f"model.layers.{li}.{n}.weight" for li in range(cfg.L) for n in layer])
 
     # ── Mapping ──
     def __iter__(self) -> Iterator[str]:
@@ -103,20 +146,28 @@ class Prepared(Mapping):
 
     def __getitem__(self, name: str) -> np.ndarray:
         cfg = self.cfg
-        if name == "model.embed_tokens.weight":
-            return _scaled(self.W[name], getattr(cfg, "emb_mult", 1.0))
         if name == "lm_head.weight":
             w = self.W["model.embed_tokens.weight"] if getattr(cfg, "tied", True) else self.W[name]
             return _scaled(w, 1.0 / getattr(cfg, "logit_div", 1.0))
+        if name == "model.norm.weight":
+            return self._norm(self.W[name])
         if not name.startswith("model.layers."):
             return self.W[name]
         li, part = name[len("model.layers."):].split(".", 1)
         part = part[:-len(".weight")]
+        if part in NORMS:
+            src = POST_NORM_SOURCE.get(part, part) if self.post_norms else part
+            w = self._norm(self.W[f"model.layers.{li}.{src}.weight"])
+            if part in QK_NORMS:                # per head dim: in the rows' order, the score scale on q's
+                w = self._permuted(w[:, None])[:, 0]
+                if part == "self_attn.q_norm" and self.q_scale is not None:
+                    w = (w.astype(np.float64) * self.q_scale).astype(np.float32)
+            return w
         if part in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"):
             w = self._qkv(li, part)
             if part != "self_attn.v_proj":
                 w = self._permuted(w)
-            if part == "self_attn.q_proj" and self.q_scale is not None:
+            if part == "self_attn.q_proj" and self.q_scale is not None and not self.qk_norm:
                 w = self._row_scaled(w, self.q_scale)
             return w
         if part in ("mlp.gate_proj", "mlp.up_proj") and self.fused_mlp:
@@ -136,6 +187,10 @@ class Prepared(Mapping):
         nq, nk = cfg.H * cfg.HD, cfg.KV * cfg.HD
         return {"self_attn.q_proj": w[:nq], "self_attn.k_proj": w[nq:nq + nk],
                 "self_attn.v_proj": w[nq + nk:]}[part]
+
+    def _norm(self, w: np.ndarray) -> np.ndarray:
+        """An RMSNorm weight: 1 + w (float32) where stored as w - 1."""
+        return (np.asarray(w, np.float64) + 1.0).astype(np.float32) if self.norm_offset else w
 
     def _permuted(self, w: np.ndarray) -> np.ndarray:
         if self.perm is None:
@@ -160,4 +215,5 @@ def prepare(cfg, W: Mapping) -> Mapping:
 
 Prepared._axi_prepared = True         # recognised across the two module copies (package / by path)
 
-__all__ = ("LAYER", "Prepared", "prepare", "rope_spec")
+__all__ = ("LAYER", "LINEARS", "NORMS", "POST_NORMS", "QK_NORMS", "Prepared", "prepare", "rope_kind",
+           "rope_kinds", "rope_spec")

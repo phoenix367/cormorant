@@ -471,7 +471,7 @@ class RMSNormRoNode(RowOpsNode):
 
     def reference(self, ins, dtype):  # noqa: ARG002
         h = np.rint(np.asarray(ins[0], np.float64).reshape(self.rows, self.n) * 2.0 ** self.fr)
-        fo = _exps(self.output, self.F)
+        fo = _exps(self.output, self.F)[:self.n]                   # one per channel of a row (head)
         y = rs.rms_norm(h.astype(np.int64), self.fr, self.gamma, self.eps, fo)
         return (y / np.power(2.0, fo.astype(np.float64))[None, :]).reshape(self.output.shape)
 
@@ -493,6 +493,48 @@ class RMSNormRoNode(RowOpsNode):
         a_s1, c_s1 = self._strides(layouts)
         return self.call(self.inputs[0].c_name, 0, "NULL", 0, self.output.c_name, 0, self.inputs[1].c_name,
                          self.opword, self.n, self.rows, 1, a_s1, 0, 0, 0, c_s1, 0, self.E, 0, 0, 0, NO_WINDOW)
+
+
+@dataclass
+class WidenRoNode(RowOpsNode):
+    """LlmWiden on the unit: an int16 tensor at its per-channel exponents ->
+    the int32 DMA tensor at the output's one exponent fc (>= each), exact: one
+    COPY, A i16 << (fc - f[c]) -> C i32 (an RMSNorm of a kernel output reads
+    it: Gemma's output and head norms, doc/plans/CHAT_PLAN.md §31).  inputs
+    [x, P, tables]."""
+    rows:  int = 1
+    n:     int = 1
+    bcast: bool = True
+
+    @property
+    def opword(self) -> int:
+        return rs.opword(rs.OP_COPY, rs.K_I16, rs.K_I16, rs.K_I32, p_bcast=self.bcast)
+
+    def _strides(self, layouts):
+        nd = self.onnx_node
+        return (row_stride_bytes(self.inputs[0], layouts, self.n, 2, nd, self.align_elems),
+                row_stride_bytes(self.output, layouts, self.n, 4, nd, self.align_elems))
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        return np.asarray(ins[0], np.float64).reshape(self.output.shape)       # exact
+
+    def kernel_calls(self, layouts: dict) -> list:
+        from .perf_calls import KernelCall
+        a_s1, c_s1 = self._strides(layouts)
+        return [KernelCall.of("RowOpsKernel", op=self.opword, n=self.n, rows=self.rows, blocks=1,
+                              a_s1=a_s1, c_s1=c_s1, win_hi=NO_WINDOW)]
+
+    def describe(self) -> str:
+        return f"rows={self.rows} n={self.n} on RowOpsKernel (COPY: int16 -> int32 at one exponent)"
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] LlmWiden({self.inputs[0].onnx_name}) -> {self.output.onnx_name}  "
+                f"[{self.rows}][{self.n}] on RowOpsKernel (COPY, int16 -> int32) */")
+
+    def emit_call(self, layouts: dict) -> str:
+        a_s1, c_s1 = self._strides(layouts)
+        return self.call(self.inputs[0].c_name, 0, "NULL", 0, self.output.c_name, 0, self.inputs[1].c_name,
+                         self.opword, self.n, self.rows, 1, a_s1, 0, 0, 0, c_s1, 0, 0, 0, 0, 0, NO_WINDOW)
 
 
 @dataclass
@@ -572,7 +614,9 @@ def from_llm_resadd(node, tensors, index, align_elems, ctx: HostContext):
 
 
 def from_llm_rmsnorm(node, tensors, index, align_elems, ctx: HostContext):
-    """LlmRMSNorm: RMSNormRoNode when h is the int32 DMA residual, else the host op."""
+    """LlmRMSNorm: RMSNormRoNode when h is an int32 DMA tensor (the residual, or an
+    LlmWiden output: then rows of gamma's length, the heads of a q / k norm), else the
+    host op."""
     from .host_nodes import _attrs
     from .llm_nodes import LlmRMSNormNode, _const_array, norm_eps
     h = tensors.get(node.input[0])
@@ -581,16 +625,19 @@ def from_llm_rmsnorm(node, tensors, index, align_elems, ctx: HostContext):
     _need_unit(node, "the int32 DMA residual")
     F = ctx.frac_bits
     y = tensors[node.output[0]]
-    n = int(h.shape[-1])
+    W = int(h.shape[-1])
     fr = _exps(h, F)
     _require((fr == fr[0]).all(), node, "h: the int32 residual at one exponent")
-    _require(y.dma is None and y.host is None and y.numel == h.numel and y.shape[-1] == n, node,
+    _require(y.dma is None and y.host is None and y.numel == h.numel and y.shape[-1] == W, node,
              "output: an int16 DMA tensor of h's shape")
     gamma = _const_array(ctx, tensors, node.input[1], node, "gamma").astype(np.float64).reshape(-1)
-    _require(gamma.size == n, node, "gamma size")
+    n = gamma.size
+    _require(W % n == 0, node, "gamma size")
     eps = norm_eps(_attrs(node))
     G, g, _bq, E = rs.norm_params(gamma, n, eps, int(fr[0]), rms=True)
     fo = _exps(y, F)
+    _require((fo.reshape(-1, n) == fo[:n]).all(), node, "output exponents: one per channel of a head")
+    fo = fo[:n]
     sh_c = rs.P1_BITS + g - fo
     _require((sh_c >= 0).all() and (sh_c <= 63).all(), node, f"gamma's exponent 2^-{g} beyond the shifts")
     _require(0 <= E < 2 ** 63, node, f"eps {eps} beyond the eps register")
@@ -599,6 +646,26 @@ def from_llm_rmsnorm(node, tensors, index, align_elems, ctx: HostContext):
     return RMSNormRoNode(onnx_node=node, inputs=[h, p, tables_tensor(tensors)], output=y, index=index,
                          align_elems=align_elems, F=F, rows=h.numel // n, n=n, fr=int(fr[0]), eps=eps,
                          g=int(g), E=int(E), bcast=bc, gamma=gamma)
+
+
+def from_llm_widen(node, tensors, index, align_elems, ctx: HostContext):
+    """LlmWiden: x int16 (per-channel exponents) -> the int32 DMA tensor at its one
+    exponent, on the unit (WidenRoNode)."""
+    _need_unit(node, "LlmWiden")
+    F = ctx.frac_bits
+    x, y = tensors[node.input[0]], tensors[node.output[0]]
+    n = int(x.shape[-1])
+    _require(x.dma is None and x.host is None, node, "x: an int16 DMA tensor")
+    _require(y.dma == "i32" and y.numel == x.numel and int(y.shape[-1]) == n, node,
+             "output: an int32 DMA tensor of x's shape")
+    fx, fy = _exps(x, F), _exps(y, F)
+    _require((fy == fy[0]).all() and (fx <= fy[0]).all() and (fy[0] - fx <= 16).all(), node,
+             f"exponents {sorted(set(int(v) for v in fx))} -> 2^-{int(fy[0])}: one output exponent, "
+             "at most 16 finer than each input's")
+    _require(n % align_elems == 0, node, f"row length {n} % {align_elems}")
+    p, bc = _pblock(tensors, f"{y.onnx_name}__rowops_p", 0, 0, fy[0] - fx, 0, 0, n)
+    return WidenRoNode(onnx_node=node, inputs=[x, p, tables_tensor(tensors)], output=y, index=index,
+                       align_elems=align_elems, F=F, rows=x.numel // n, n=n, bcast=bc)
 
 
 def from_llm_silu_mul(node, tensors, index, align_elems, ctx: HostContext):
@@ -2691,6 +2758,7 @@ LLM_OVERRIDES = {
     "LlmSelectRow": from_llm_select_row,
     "LlmResAdd":   from_llm_resadd,
     "LlmRMSNorm":  from_llm_rmsnorm,
+    "LlmWiden":    from_llm_widen,
     "LlmSiluMul":  from_llm_silu_mul,
     "LlmAttnPrep": from_llm_attn_prep,
 }
@@ -2698,7 +2766,8 @@ LLM_OVERRIDES = {
 
 __all__ = ("TABLES_NAME", "NO_WINDOW", "enabled", "raw_as_data", "tables_tensor", "param_tensor",
            "row_stride_bytes", "RowOpsNode", "LayerNormRoNode", "layernorm_ineligible",
-           "from_onnx_layernorm", "ResAddRoNode", "RMSNormRoNode", "SiluMulRoNode", "LLM_OVERRIDES",
+           "from_onnx_layernorm", "ResAddRoNode", "RMSNormRoNode", "WidenRoNode", "SiluMulRoNode",
+           "LLM_OVERRIDES",
            "AttnPrepRoNode", "from_llm_attn_prep", "rope_raw_tensor", "zero_param_tensor", "vimage_jobs",
            "ATTN_PREP_C", "QIMAGE_R", "VitAttnPrepRoNode", "from_vit_attn_prep", "TtsRowPrepRoNode",
            "from_tts_rowprep", "TransposeRoNode", "transpose_job", "from_onnx_transpose",

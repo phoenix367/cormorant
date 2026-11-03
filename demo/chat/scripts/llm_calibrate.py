@@ -78,6 +78,14 @@ DEFAULT_MODEL = llm_model.DEFAULT_MODEL           # its study files in assets/st
 HF = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 SHIPPED_POLICIES = "bf16,pow2+sink+p12,pow2+sink+p12+mix"
 SHIPPED = "pow2+sink+p12"             # FPGA attention in prefill and decode (doc/plans/KV_DECODE_PLAN.md)
+
+
+def shipped_policies(spec: dict):
+    """(the study's policies, the one whose metrics are recorded) of a model: its
+    calibration policy (formats.policy; SmolLM2's pow2+sink+p12 with the mixed one
+    beside it), bf16 as the yardstick."""
+    fpol = (spec.get("formats") or {}).get("policy") or SHIPPED
+    return (SHIPPED_POLICIES if fpol == SHIPPED else f"bf16,{fpol}"), fpol
 CHECKPOINT_FILES = ("config.json", "generation_config.json", "model.safetensors", "tokenizer.json",
                     "tokenizer_config.json", "special_tokens_map.json", "vocab.json", "merges.txt")
 # pinned too when the repository has them: chat templates kept beside the
@@ -395,9 +403,10 @@ def cmd_study(m: dict, model: str, root: Path, py: Optional[str], *, quick: bool
     spec = model_spec(m, model)
     verify_inputs(m, model, root)
     out = study_dir(root, model) / ("shipped_quick" if quick else "shipped")
-    args = ["study", "--assets", str(root / model), "--policies", SHIPPED_POLICIES, "--out", str(out)]
+    pols, fpol = shipped_policies(spec)
+    args = ["study", "--assets", str(root / model), "--policies", pols, "--out", str(out)]
     run_study(study_python(py), args + (["--quick"] if quick else []))
-    got = study_metrics(out / "results.json")
+    got = study_metrics(out / "results.json", fpol)
     print(f"study {model}: {json.dumps(got)}")
     want = spec.get("study")
     if record and not quick:

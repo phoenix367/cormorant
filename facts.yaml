@@ -972,7 +972,8 @@ facts:
         extra_ok: [LlmAttnConvNode, LlmNode, VitNode, TtsNode, LlmDecode,
                    LlmKernelNode, VitGeluVopNode, TtsAddVopNode,
                    LlmAttnSoftmaxVopNode, VitAttnSoftmaxVopNode,
-                   TtsAttnSoftmaxVopNode]   # kernel-call node classes
+                   TtsAttnSoftmaxVopNode,   # kernel-call node classes
+                   LlmWiden]                # a row-ops unit op only (rowops_nodes.LLM_OVERRIDES)
 
 - id: scheduler.event_kinds
   kind: interface
@@ -1945,7 +1946,7 @@ facts:
       speech_chars: {file: demo/chat/kv260_chat_server.py, regex: '^MAX_SPEECH_INPUT = (\d+)', type: int}
   fix: auto
   mentions:
-    - {file: README.md, regex: 'context (?P<context>\d+) \|', count: 3}
+    - {file: README.md, regex: 'context (?P<context>\d+) \|', count: 4}
     - {file: README.md, regex: 'up to (?P<speech_chars>\d+) characters'}
     - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'the text, up to (?P<speech_chars>\d+) characters'}
     - {file: demo/chat/chat_config.json.example, regex: '"context": (?P<context>\d+),', fix: report}

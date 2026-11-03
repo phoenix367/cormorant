@@ -49,7 +49,7 @@ def study_model(W, fd, cfg, policy=None):
         c, l = k.split("@")
         fmt[(c, int(l))] = v if isinstance(v, int) else np.asarray(v, np.int64)
     fm = study.Model(W, sc, None)
-    return study.Model(W, sc, study.POLICIES[policy or lp.POLICY], fmt, sink_model=fm), sc
+    return study.Model(W, sc, study.policy_spec(policy or lp.POLICY), fmt, sink_model=fm), sc
 
 
 def main():
@@ -89,9 +89,10 @@ def main():
     cont = set(filter(None, args.second_turn.split(",")))
     vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"
     rowops = lp.rowops_default() if args.rowops == "auto" else args.rowops == "on"
-    drope = lp.drope_default(rowops) if args.drope == "auto" else args.drope == "on"
-    policy = lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope)
     cfg, W, fmt, fd = lp.load_model(assets, args.formats)
+    drope = lp.drope_default(rowops, cfg) if args.drope == "auto" else args.drope == "on"
+    policy = lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope, cfg,
+                       fd.get("policy") or lp.FORMATS_POLICY)
     fe = lp.frontend(cfg, W, fmt, ctx=ctx, prefill_attn=args.prefill_attn,
                      decode_attn=args.decode_attn, vsmx=vsmx, rowops=rowops, drope=drope)
     cgs = lp.make_codegens(fe, buckets)

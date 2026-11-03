@@ -110,14 +110,18 @@ class TestManifest(unittest.TestCase):
                     self.assertEqual(len(spec["texts"]), 2)
                     for t in spec["texts"].values():
                         self.assertRegex(t["sha256"], HEX64)
-                else:
-                    self.assertEqual(sorted(spec["files"]), sorted(lc.CHECKPOINT_FILES))
+                else:                               # what `add` pins: the repo's tokenizer files beside
+                    allowed = set(lc.CHECKPOINT_FILES) | set(lc.EXTRA_FILES)     # the checkpoint
+                    self.assertLessEqual(set(spec["files"]), allowed)
+                    self.assertLessEqual({"config.json", "model.safetensors", "tokenizer.json",
+                                          "tokenizer_config.json"}, set(spec["files"]))
                 for h in spec["files"].values():
                     self.assertRegex(h, HEX64)
-                self.assertEqual(spec["formats"]["policy"], "pow2+sink+p12")
+                # SmolLM2's calibration policy, or one composed on it (Gemma 3: + exponent caps)
+                self.assertTrue(spec["formats"]["policy"].startswith(lc.SHIPPED), spec["formats"]["policy"])
                 self.assertRegex(spec["formats"]["sha256"], HEX64)
                 if "study" in spec:
-                    self.assertEqual(spec["study"]["policy"], lc.SHIPPED)
+                    self.assertEqual(spec["study"]["policy"], lc.shipped_policies(spec)[1])
         self.assertEqual(len(m["texts"]), 2)
         for name, t in m["texts"].items():
             self.assertRegex(t["sha256"], HEX64)

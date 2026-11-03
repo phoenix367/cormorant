@@ -26,6 +26,7 @@ board, a three-question conversation that the model remembers.
 | `smolvlm-256m-instruct` | `smolvlm` | Answers questions about images | 1.6 s per image, then ~20 tokens/s | [Chat about images](doc/SMOLVLM.md) |
 | `piper-lessac-medium` | `piper` | Text to speech (`POST /v1/audio/speech`) | first sound after 1.0–1.5 s, faster than real time | [Text to speech](doc/TEXT_TO_SPEECH.md); listen: ▶ [hello](../tts/samples/hello.mp3), ▶ [paragraph](../tts/samples/paragraph.mp3) |
 | `moonshine-base` | `moonshine` | Speech to text (`POST /v1/audio/transcriptions`) | 1.3 s for 10 s of audio | [Speech to text](doc/SPEECH_TO_TEXT.md) |
+| `gemma-3-270m-it` | `gemma-3-270m-it` (an `llm_models` entry) | Multi-turn chat with Google's Gemma 3 (270M) | ~11 tokens/s; first token after 0.14–0.57 s | [CHAT_PLAN §31](../../doc/plans/CHAT_PLAN.md) |
 | `stories15m` | `stories15m` | Writes children's stories: continues the text it is given (`POST /v1/completions`, or a chat: a story's opening, "write a story about …", "continue") | ~166 tokens/s (130–150 greedy through the API); first token after ~20 ms | [Stories](doc/STORIES.md) |
 
 - **Other models.**  Any Llama-family checkpoint the generator builds
@@ -155,7 +156,7 @@ for.
 ## Tests
 
 ```bash
-cd demo/chat/tests && python3 -m unittest      # 334 tests, ~45 s, no board needed
+cd demo/chat/tests && python3 -m unittest      # 335 tests, ~45 s, no board needed
 ```
 
 Some tests skip until the tokenizers they read are downloaded; see

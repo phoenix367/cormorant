@@ -134,7 +134,8 @@ EXPORT_PY = os.path.join(os.path.dirname(os.path.dirname(CHAT)), ".venv-export",
 class TestBlocksVsTransformers(unittest.TestCase):
     """llm_study.py validate-arch: a tiny random checkpoint of every block the
     stack implements (Llama and its RoPE scalings, Mistral, Granite, Phi-3 with
-    partial rotation and longrope), saved by transformers, through llm_arch /
+    partial rotation and longrope, Gemma 3 with a window the sequence cuts and a
+    score scale of its own, Qwen3), saved by transformers, through llm_arch /
     llm_weights / rope, against transformers' own logits."""
 
     def test_validate_arch(self):

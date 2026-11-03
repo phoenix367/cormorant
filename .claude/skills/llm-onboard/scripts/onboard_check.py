@@ -8,7 +8,7 @@ the SmolLM2 path it can take UNCHANGED and which need code, before an hour of
 calibration and a 30 GB project generation.  Host only, stdlib only, reads the
 assets directory (after `llm_calibrate.py add` / `fetch`).
 
-What llama_fit.py does not check, and where the path hard-codes SmolLM2:
+What llama_fit.py does not check (doc/plans/CHAT_PLAN.md §28 – §31):
   * tokenizer.json   the server's pure-Python tokenizer (demo/chat/
                      hf_tokenizer.py) interprets the pipeline (BPE with the
                      usual normalizers, pre-tokenizers, decoders and added
@@ -16,35 +16,33 @@ What llama_fit.py does not check, and where the path hard-codes SmolLM2:
                      support (a WordPiece / Unigram model, a Precompiled
                      normalizer, ...); validate_text.py --assets checks a
                      loaded one against `tokenizers`;
-  * special ids      <|im_start|> = 1 is the attention sink everywhere
-                     (llm_study.py sink_token 1 and held-out windows,
-                     llm_sched_check.py's assert), <|im_end|> = 2 is
-                     llm_study.EOS; the backend finds them by name;
-  * chat template    llm_study.chatml() and demo/chat/chatml.py are SmolLM2's
-                     ChatML with its default system prompt;
-  * prompt ids       llm_project.tokenize_prompts() / second_turn_ids() — the
-                     gates' prompts — always use the SmolLM2-135M tokenizer and
-                     cache the ids in assets/study/phase3_prompt_ids.json /
-                     phase5_second_turn_ids.json; llm_lib_check.py hard-codes
-                     SmolLM2 ids; valid only for SmolLM2's exact tokenizer.json;
-  * vocabulary       the backend refuses a library whose llm_vocab_size() is
-                     not the tokenizer's size;
+  * the profile      the sink, the end-of-generation ids and the context from
+                     the checkpoint's files (llm_model.Profile), the chat
+                     template rendered as apply_chat_template does
+                     (demo/chat/chat_template.py, jinja2) — `llm_calibrate.py
+                     validate` checks the prompts' ids against Hugging Face;
+  * vocabulary       the library may have more rows than the tokenizer has
+                     tokens (padded), or fewer where every extra tokenizer id
+                     is an added special token (Gemma 3's <image_soft_token>);
   * K bound          every linear's K (hidden, heads x head_dim, FFN) must fit
                      MatmulKernel's max_k (platforms/<p>.json): the decode GEMV
                      runs there and src/llama.py does not split K;
+  * head_dim         the row-ops unit's ROPE takes heads of <= 128 dims: a wider
+                     head keeps the attention prep on the host (+hprep, no drope);
   * names            --model-name -> project dir, board library, weights dir,
-                     served model id; a name equal to a served one replaces it.
+                     served model id; a name equal to a served one replaces it;
+                     a new name is served by a chat_config.json llm_models entry
+                     (the registry, CHAT_PLAN §29).
 
 usage: python3 .claude/skills/llm-onboard/scripts/onboard_check.py demo/chat/assets/<name>
            [--name MODEL_NAME] [--platform kv260]
-exit: 0 = the SmolLM2 text path applies unchanged (serving needs only a
-backend slot), 1 = code needed (listed), 2 = missing input.
+exit: 0 = the text path applies unchanged (serving needs only a config
+entry), 1 = code needed (listed), 2 = missing input.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -55,23 +53,12 @@ CHAT = REPO / "demo" / "chat"
 sys.path.insert(0, str(CHAT / "scripts"))
 import llm_model                                    # noqa: E402  (the scripts' names; stdlib only)
 MANIFEST = CHAT / "scripts" / "llm_models.json"
-# SHA-256 of SmolLM2-135M / 360M-Instruct's tokenizer_config.json chat_template
-# (identical in both; demo/chat/chatml.py and llm_study.chatml() render it).
-SMOLLM2_TEMPLATE_SHA = "872be49dbb638044ad01b60388f48d469ff2980e5f0dccdc22ec907db54d0788"
 SERVED = {                                             # model id -> backend (kv260_chat_server.py)
     "smollm2-135m-instruct": "smollm2 (--llm-*, chat_config.json smollm2 block)",
     "smollm2-360m-instruct": "smollm2-360m (--llm-360m-*, smollm2_360m block)",
     "smolvlm-256m-instruct": "smolvlm (--vlm-*, smolvlm block)",
     "stories15m": "stories15m (--stories-*, stories15m block)",
 }
-
-
-def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for b in iter(lambda: f.read(1 << 20), b""):
-            h.update(b)
-    return h.hexdigest()
 
 
 def main(argv=None) -> int:
@@ -109,6 +96,9 @@ def main(argv=None) -> int:
                     "bound (a bitstream change)" % (max_k, ", ".join(f"{k} {v}" for k, v in over.items())))
     else:
         reuse.append(f"K bound: hidden {D}, o_proj {H * HD}, FFN {F} <= max_k {max_k}")
+    if HD > 128:
+        notes.append(f"head_dim {HD} > 128 (the row-ops unit's ROPE): the attention prep stays on the "
+                     f"host (policy ...+rowops+hprep; generate_llm_project.py picks it, no drope)")
     if not (d / "model.safetensors").exists() and not (d / "model.safetensors.index.json").exists():
         code.append("no model.safetensors / model.safetensors.index.json in the checkpoint")
 
@@ -120,9 +110,8 @@ def main(argv=None) -> int:
         notes.append(f"{name} is served today by backend {SERVED[name]}: onboarding it replaces "
                      f"that model's library")
     elif not vlm:
-        notes.append(f"serving: no backend serves {name} — add a backend entry (the smollm2-360m "
-                     f"pattern) or repoint an existing slot's lib / tokenizer / cma_mb (replaces "
-                     f"that model)")
+        notes.append(f"serving: \"llm_models\": {{\"{name}\": {{}}}} in chat_config.json and {name} in "
+                     f"server.backends (deploy.py derives kind, library, tokenizer and cma_mb)")
     if vlm and name == "smolvlm-256m-instruct":
         reuse.append("SmolVLM-256M has its own text / image path: pins vlm_study_inputs.json, "
                      "vlm_study.py fetch / formats, vlm_sched_check.py --text, vlm_host_emu.py, "
@@ -151,8 +140,13 @@ def main(argv=None) -> int:
                     f"(demo/chat/hf_tokenizer.py) needs that part, validate_text.py its check")
     V = int(tc["vocab_size"])
     if tok is not None and tok.vocab_size > V:
-        code.append(f"tokenizer size {tok.vocab_size} > config vocab_size {V}: ids beyond the "
-                    f"library's logits")
+        extra = [i for i in range(V, tok.vocab_size) if not tok.is_special(i)]
+        if extra:
+            code.append(f"tokenizer size {tok.vocab_size} > config vocab_size {V}, ids {extra[:4]} not "
+                        f"special: tokens the library has no logits / embedding rows for")
+        else:
+            reuse.append(f"tokenizer size {tok.vocab_size} > config vocab_size {V}: the extra ids are "
+                         f"added special tokens (never sampled; refused in a prompt)")
     # the sink, the end-of-generation ids and the context, as the study and the gates derive them
     try:
         prof = llm_model.Profile(str(d))
@@ -162,20 +156,8 @@ def main(argv=None) -> int:
         code.append(f"profile: {e}")
         prof = None
     if prof is not None and prof.chat:
-        tmpl = prof.template
-        if hashlib.sha256(tmpl.encode()).hexdigest() == SMOLLM2_TEMPLATE_SHA:
-            reuse.append("chat template: SmolLM2's ChatML with its default system prompt "
-                         "(chatml.py, llm_study.chatml)")
-        elif "<|im_start|>" in tmpl and "<|im_end|>" in tmpl:
-            code.append("a ChatML template other than SmolLM2's: llm_study.chatml() and "
-                        "demo/chat/chatml.py render SmolLM2's (its default system prompt); "
-                        "`llm_calibrate.py validate` fails where they differ")
-        else:
-            code.append("the chat template is not ChatML: llm_study.chatml() (study, prompts, "
-                        "gates) and demo/chat/chatml.py (server) render ChatML only")
-        if tok is not None and tok.special.get("<|im_start|>") != prof.sink:
-            code.append(f"the sink is token {prof.sink}, but the chat backend (smollm2_backend.py) "
-                        f"takes <|im_start|> = {tok.special.get('<|im_start|>')}")
+        reuse.append("chat template: rendered from the checkpoint as apply_chat_template does "
+                     "(demo/chat/chat_template.py; `llm_calibrate.py validate` compares the prompts' ids)")
     elif prof is not None:
         notes.append("no chat template: a base model — the text profile (llm_study.STORY_PROMPTS "
                      "and the TinyStories texts, the stories backend's chat mapping) assumes "
@@ -190,7 +172,7 @@ def main(argv=None) -> int:
     return report(name, d, reuse, code, notes)
 
 
-def report(name, d, reuse, code, notes, path="the SmolLM2 path") -> int:
+def report(name, d, reuse, code, notes, path="the text path") -> int:
     print(f"== {name}  ({d})")
     for x in reuse:
         print(f"  reuse  {x}")
@@ -198,7 +180,7 @@ def report(name, d, reuse, code, notes, path="the SmolLM2 path") -> int:
         print(f"  CODE   {x}")
     for x in notes:
         print(f"  note   {x}")
-    print("verdict: " + (f"{path} applies unchanged (serving: a backend slot)" if not code
+    print("verdict: " + (f"{path} applies unchanged (serving: a chat_config.json entry)" if not code
                          else f"{len(code)} item(s) need code before the path applies"))
     return 1 if code else 0
 

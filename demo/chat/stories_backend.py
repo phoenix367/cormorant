@@ -186,6 +186,7 @@ class StoriesBackend(Smollm2Backend):
                 f"There is no story to continue: {self.model_id} writes children's stories — type "
                 f"how one begins (\"Lily found a little red ball.\"), or ask for one (\"Write a story "
                 f"about a cat\").", param)
+        self._check_ids(body, param)
         reserve = min(req.max_tokens, self.reserve) if req.max_tokens else self.reserve
         keep = max(1, self.ctx - reserve - 1)                  # position 0 is the sink <s>
         dropped = max(0, len(body) - keep)

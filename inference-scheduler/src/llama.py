@@ -66,19 +66,23 @@ from .graph_builder import (RES_BITS, ExponentTable, GraphBuilder, cheapest_qk_k
                             group_order, pv_exp, score_exp)
 from .llm_arch import LlamaConfig
 from .llm_nodes import LLM_DOMAIN
-from .llm_weights import LINEARS, prepare, rope_spec
+from .llm_weights import LINEARS, prepare, rope_kind, rope_kinds, rope_spec
 
 
 # ------------------------------------------------------------------ #
 # Config / weights                                                     #
 # ------------------------------------------------------------------ #
 
-def rope_tables(cfg: LlamaConfig, n: int):
+def rope_tables(cfg: LlamaConfig, n: int, layer: Optional[int] = None):
     """float32 cos / sin [n][HD/2] as llm_study.rope_tables (src/rope.py:
     inv_j = float32(1 / theta^(2j/HD)) or its scaling, a = float32(float32(pos)
     * inv_j), cos = float32(cos(double(a))) (libm); partial rotation's
-    pass-through pairs cos 1, sin 0)."""
-    return rope.half_tables(rope_spec(cfg), n)
+    pass-through pairs cos 1, sin 0); ``layer``: that layer's (a sliding
+    layer's own theta)."""
+    return rope.half_tables(rope_spec(cfg, layer), n)
+
+
+ROPE_NAMES = {"global": ("rope.cos", "rope.sin"), "local": ("rope.local.cos", "rope.local.sin")}
 
 
 # ------------------------------------------------------------------ #
@@ -94,6 +98,12 @@ class Formats(ExponentTable):
         self.cfg = cfg
         self.sink_k = d.get("sink_k_raw")
         self.sink_v = d.get("sink_v_raw")
+
+    @property
+    def res_bits(self) -> int:
+        """The int32 residual's exponent: RES_BITS, or the calibration's coarser one
+        ("res@L", a residual beyond 2^16: Gemma 3)."""
+        return int(self.exp.get(f"res@{self.cfg.L}", RES_BITS))
 
     def get(self, cls_: str, layer: int, n: int) -> np.ndarray:
         """Exponent vector of length n (a scalar is broadcast).  A class the
@@ -137,7 +147,7 @@ class LlamaFrontend(GraphBuilder):
                  decode_attn: str = "host",
                  qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
                  image_rows: int = 0, image_state: str = "vlm.img", vsmx: bool = False,
-                 rowops: bool = False, drope: bool = False):
+                 rowops: bool = False, drope: bool = False, uprep: Optional[bool] = None):
         # vsmx (policy pow2+sink+p12+vsmx, doc/plans/SOFTMAX_PLAN.md): the FPGA
         # prefill's softmax on VectorOPKernel's softmax unit (LlmAttnSoftmax
         # vsmx = 1, src/smx_nodes.py); decode steps keep the host softmax
@@ -159,6 +169,16 @@ class LlamaFrontend(GraphBuilder):
         self.drope = bool(drope)
         if self.drope and not self.rowops:
             raise ValueError("drope needs rowops (the decode prep on the row-ops unit)")
+        # uprep (rowops): the attention prep — RoPE, the cache rows, the q image — on the unit
+        # (HOSTOPS_PLAN §10); its ROPE takes heads of at most 128 dims, so a wider head (Gemma 3's
+        # 256) keeps the prep on the host (policy ...+rowops+hprep)
+        self.uprep = (self.rowops and cfg.HD <= 128) if uprep is None else bool(uprep)
+        if self.uprep and not self.rowops:
+            raise ValueError("uprep needs rowops")
+        if self.uprep and cfg.HD > 128:
+            raise ValueError(f"uprep: head_dim {cfg.HD} beyond the unit's ROPE segment (128)")
+        if self.drope and not self.uprep:
+            raise ValueError("drope needs the attention prep on the unit (uprep)")
         # image_rows > 0 (a VLM's text model, src/vit.py): the prefill entries'
         # LlmEmbed also reads image_state [image_rows][D] (float32 host state the
         # vision entry writes); ids V .. V + image_rows - 1 select its rows
@@ -170,9 +190,9 @@ class LlamaFrontend(GraphBuilder):
         self.W = prepare(cfg, weights)
         self.fmt = formats
         self.C = int(ctx)
-        if cfg.window is not None and cfg.window < self.C:
-            raise ValueError(f"sliding window {cfg.window} < context {self.C}: windowed attention "
-                             f"is not implemented")
+        self.res_bits = formats.res_bits
+        if self.image_rows and cfg.emb_mult != 1.0:
+            raise ValueError("an embedding multiplier with image rows is not implemented")
         self.name = name
         if prefill_attn not in ("fpga", "host"):
             raise ValueError(f"prefill_attn must be 'fpga' or 'host', got {prefill_attn!r}")
@@ -197,7 +217,13 @@ class LlamaFrontend(GraphBuilder):
             raise ValueError(f"FPGA prefill attention: context {self.C} must be a multiple of 16")
         if formats.sink_k is None or formats.sink_v is None:
             raise ValueError("formats: sink_k_raw / sink_v_raw missing (policy with a sink)")
-        self._cos, self._sin = rope_tables(cfg, self.C)
+        if any(cfg.layer_window(li) is not None for li in range(cfg.L)) and (prefill_attn, decode_attn) != (
+                "fpga", "fpga"):
+            # LlmAttention (the host region) has no window; the FPGA attention's host softmax does
+            raise ValueError("sliding windows need the FPGA attention in prefill and decode")
+        # the RoPE tables per kind ("global"; Gemma 3's sliding layers' own theta: "local")
+        self._rope = {k: rope_tables(cfg, self.C, li) for k, li in rope_kinds(cfg).items()}
+        self._cos, self._sin = self._rope["global"]
         self._consts: Dict[str, np.ndarray] = {}
 
     # ---- shared constants ------------------------------------------------ #
@@ -243,26 +269,42 @@ class LlamaFrontend(GraphBuilder):
                             f"{e}.l{li}.{key}_proj")
 
     def _res(self, name, T, state=False):
-        """A residual-stream tensor [T][D]: with rowops the int32 DMA tensor, else
-        float32 host."""
-        return self._residual(name, T, self.cfg.D, self.rowops, state)
+        """A residual-stream tensor [T][D]: with rowops the int32 DMA tensor (at
+        2^-res_bits), else float32 host."""
+        return self._residual(name, T, self.cfg.D, self.rowops, state, self.res_bits)
 
     def _resadd(self, h, delta, out, T, name, key, li):
         if self.rowops:
             fd = np.asarray(self.fmt.get(key, li, self.cfg.D), np.int64)
-            if (fd > RES_BITS).any():
-                raise ValueError(f"rowops: the {key} exponents of layer {li} exceed 2^-{RES_BITS} "
+            if (fd > self.res_bits).any():
+                raise ValueError(f"rowops: the {key} exponents of layer {li} exceed 2^-{self.res_bits} "
                                  f"(max {int(fd.max())}): the residual add would not be exact")
         y = self._res(out, T)
         self._node("LlmResAdd", [h, delta], [y], name, domain=LLM_DOMAIN)
         return y
 
-    def _rmsnorm(self, h, gamma_name, gamma, T, out, exp, name):
+    def _rmsnorm(self, h, gamma_name, gamma, T, out, exp, name, width=None):
         self._init(gamma_name, gamma)
-        y = self._t(out, [T, self.cfg.D], exp=exp)
+        y = self._t(out, [T, width or self.cfg.D], exp=exp)
         self._node("LlmRMSNorm", [h, gamma_name], [y], name, domain=LLM_DOMAIN,
                    axi_eps=repr(float(self.cfg.eps)))
         return y
+
+    def _out_norm(self, li, x, cin, cls, wname, T, width, nh=None):
+        """An RMSNorm of the kernel output x [T][width] (cin its formats class): Gemma's
+        attention / MLP output norms (cls on / dn) and q / k head norms (qn / kn, nh heads:
+        gamma [HD]).  With rowops, x is first widened exactly to int32 at its finest
+        exponent (LlmWiden, one COPY) and normed on the unit; else the host norms the
+        int16 rows."""
+        e = self._e
+        src = x
+        if self.rowops:
+            fc = int(np.max(self.fmt.get(cin, li, width)))
+            src = self._t(f"{e}.l{li}.{cls}w", [T, width], exp=fc, dma="i32")
+            self._node("LlmWiden", [x], [src], f"{e}.l{li}.{cls}_widen", domain=LLM_DOMAIN)
+        return self._rmsnorm(src, f"g.l{li}.{cls}", self.W[f"model.layers.{li}.{wname}.weight"], T,
+                             f"{e}.l{li}.{cls}", self.fmt.get(cls, li, width), f"{e}.l{li}.norm_{cls}",
+                             width=width)
 
     def choose_qk_kw(self, T: int) -> int:
         """Kernel width of the q.K^T calls' q image (the frontend writes the
@@ -284,7 +326,7 @@ class LlamaFrontend(GraphBuilder):
         self._init(vc, self._cache_init(li, "v"))
         return kc, vc
 
-    def _fpga_attention(self, li, q0, k0, v, T, pos, n, kc, vc):
+    def _fpga_attention(self, li, q0, k0, v, T, pos, n, kc, vc, rope_in):
         """Per layer: LlmAttnPrep, then per KV group q.K^T (ConvKernel), the
         p12 softmax (host) and P.V (ConvKernel), then LlmAttnMerge — in the
         order graph_builder.group_order "ahead1": each softmax follows a
@@ -297,12 +339,12 @@ class LlamaFrontend(GraphBuilder):
         fp = fm.heads("p", li, H)
         # rowops (HOSTOPS_PLAN §10): the prefill's prep runs on the unit, which
         # writes the q image at kw = 1 (its TRANSPOSE granules are one column)
-        kw = 1 if self.rowops else self.choose_qk_kw(T)
+        kw = 1 if self.uprep else self.choose_qk_kw(T)
         common = dict(num_heads=H, num_kv_heads=KV, head_dim=HD, key_quantum=16 * self.pv_kw)
         qx = self._t(f"{e}.l{li}.qx", [KV, HD, G * T], exp=0)
-        prep_in = [q0, k0, v, pos, n, kc, vc, "rope.cos", "rope.sin"]
+        prep_in = [q0, k0, v, pos, n, kc, vc] + list(rope_in)
         prep_attrs = {}
-        if self.rowops and (n or self.drope):
+        if self.uprep and (n or self.drope):
             # the unit's jobs stage the rotated rows in DMA states of the entry
             # (rowops_nodes.AttnPrepRoNode); v is re-rounded only where the V
             # cache's exponents differ from the projection's
@@ -319,7 +361,7 @@ class LlamaFrontend(GraphBuilder):
             # first: zero the q staging rows past n once per run (a decode step's one row is
             # always written)
             prep_attrs = dict(rowops=1, first=int(li == 0 and bool(n)))
-        elif self.rowops:
+        elif self.uprep:
             # a decode step: the host prep writes 2-byte V slots into lines the
             # unit filled during the prefill — invalidate them first (§10.5)
             prep_attrs = dict(rowops_cache=1)
@@ -335,7 +377,12 @@ class LlamaFrontend(GraphBuilder):
         if self.vsmx and n and T % 16:
             raise ValueError(f"vsmx: prefill rows {T} must be a multiple of 16 (the softmax "
                              f"unit's column blocks)")
-        vsmx = dict(vsmx=1) if (self.vsmx and n) else {}
+        # a sliding layer: the host's softmax with its window (the unit's mask is a valid
+        # length), in prefill and decode alike (llm_study softmax unit=False)
+        win = c.layer_window(li)
+        vsmx = dict(vsmx=1) if (self.vsmx and n and win is None) else {}
+        if win is not None:
+            vsmx = dict(window=int(win)) if win < self.C else {}
 
         def softmax(g):
             hs = slice(g * G, (g + 1) * G)
@@ -356,35 +403,49 @@ class LlamaFrontend(GraphBuilder):
 
     def _layers(self, h, T, pos, n):
         c, fm, e = self.cfg, self.fmt, self._e
-        self._init("rope.cos", self._cos)
-        self._init("rope.sin", self._sin)
+        for kind, (cn, sn) in ROPE_NAMES.items():
+            if kind in self._rope:
+                self._init(cn, self._rope[kind][0])
+                self._init(sn, self._rope[kind][1])
         for li in range(c.L):
+            rope_in = ROPE_NAMES[rope_kind(c, li)]
             x = self._rmsnorm(h, f"g.l{li}.in", self.W[f"model.layers.{li}.input_layernorm.weight"],
                               T, f"{e}.l{li}.x", fm.get("x", li, c.D), f"{e}.l{li}.norm_in")
             q0 = self._linear(li, "q", x, T, fm.get("q0", li, c.H * c.HD))
             k0 = self._linear(li, "k", x, T, fm.get("k0", li, c.KV * c.HD))
             v = self._linear(li, "v", x, T, fm.get("v", li, c.KV * c.HD))
+            if c.qk_norm:                       # an RMSNorm of every q / k head before RoPE
+                q0 = self._out_norm(li, q0, "q0", "qn", "self_attn.q_norm", T, c.H * c.HD, c.H)
+                k0 = self._out_norm(li, k0, "k0", "kn", "self_attn.k_norm", T, c.KV * c.HD, c.KV)
             kc, vc = self._caches(li)
             if self.prefill_attn == "fpga" and (n is not None or self.decode_attn == "fpga"):
-                pv = self._fpga_attention(li, q0, k0, v, T, pos, n or "", kc, vc)
+                pv = self._fpga_attention(li, q0, k0, v, T, pos, n or "", kc, vc, rope_in)
             else:
                 pv = self._t(f"{e}.l{li}.pv", [T, c.H * c.HD], exp=fm.pv(li))
-                self._node("LlmAttention", [q0, k0, v, pos, n or "", kc, vc, "rope.cos",
-                                            "rope.sin"],
+                self._node("LlmAttention", [q0, k0, v, pos, n or "", kc, vc] + list(rope_in),
                            [pv], f"{e}.l{li}.attn", domain=LLM_DOMAIN,
                            num_heads=c.H, num_kv_heads=c.KV, head_dim=c.HD)
             o = self._linear(li, "o", pv, T, fm.get("o", li, c.D))
-            h1 = self._resadd(h, o, f"{e}.l{li}.h1", T, f"{e}.l{li}.res_attn", "o", li)
+            if c.post_norms:                    # the attention output's norm before its add
+                o = self._out_norm(li, o, "o", "on", "attn_out_norm", T, c.D)
+            h1 = self._resadd(h, o, f"{e}.l{li}.h1", T, f"{e}.l{li}.res_attn",
+                              "on" if c.post_norms else "o", li)
             x2 = self._rmsnorm(h1, f"g.l{li}.post",
                                self.W[f"model.layers.{li}.post_attention_layernorm.weight"],
                                T, f"{e}.l{li}.x2", fm.get("x2", li, c.D), f"{e}.l{li}.norm_post")
             g = self._linear(li, "g", x2, T, fm.get("g", li, c.FF))
             u = self._linear(li, "u", x2, T, fm.get("u", li, c.FF))
             a = self._t(f"{e}.l{li}.a", [T, c.FF], exp=fm.get("a", li, c.FF))
-            self._node("LlmSiluMul", [g, u], [a], f"{e}.l{li}.silu_mul", domain=LLM_DOMAIN,
-                       **(dict(rowops=1) if self.rowops else {}))
+            if c.act == "gelu_tanh":            # Gemma's GELU-tanh gate: a host op (no unit op)
+                self._node("LlmGeluMul", [g, u], [a], f"{e}.l{li}.gelu_mul", domain=LLM_DOMAIN)
+            else:
+                self._node("LlmSiluMul", [g, u], [a], f"{e}.l{li}.silu_mul", domain=LLM_DOMAIN,
+                           **(dict(rowops=1) if self.rowops else {}))
             d = self._linear(li, "d", a, T, fm.get("d", li, c.D))
-            h = self._resadd(h1, d, f"{e}.l{li}.h2", T, f"{e}.l{li}.res_mlp", "d", li)
+            if c.post_norms:
+                d = self._out_norm(li, d, "d", "dn", "mlp_out_norm", T, c.D)
+            h = self._resadd(h1, d, f"{e}.l{li}.h2", T, f"{e}.l{li}.res_mlp",
+                             "dn" if c.post_norms else "d", li)
         return h
 
     def _head(self, h):
@@ -419,7 +480,9 @@ class LlamaFrontend(GraphBuilder):
                           **(dict(dma="f32") if self.rowops else dict(host="f32")))
             self._init(img, np.zeros((self.image_rows, c.D), np.float32))
             emb_in.append(img)
-        self._node("LlmEmbed", emb_in, [h0], f"{ename}.embed", domain=LLM_DOMAIN)
+        # the embedding multiplier (Gemma's sqrt(hidden), Granite's): a float32 product at the lookup
+        self._node("LlmEmbed", emb_in, [h0], f"{ename}.embed", domain=LLM_DOMAIN,
+                   **(dict(axi_scale=repr(float(c.emb_mult))) if c.emb_mult != 1.0 else {}))
         h = self._layers(h0, T, pos, n)
         outputs = []
         if select:

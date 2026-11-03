@@ -38,6 +38,11 @@ Step 3 (2026-11-03): the five frontends (Llama, ViT, SmolVLA, Moonshine, Piper)
 build their graphs on one GraphBuilder, look their exponents up in one strict
 table and share the FPGA attention's helpers — every shipped entry graph
 unchanged (§30).
+Step 4 (2026-11-04): new numerics driven by Gemma-3-270M-it — (1 + w) norms,
+the √hidden embedding, q / k head norms, output norms, a GELU-tanh MLP,
+512-key sliding windows with their own RoPE (also Qwen3's head norms) — in
+the study, the frontend and the generated C, bit-exact; its int16 policy within
+0.6 % of float's perplexity (§31).
 Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
@@ -2831,3 +2836,146 @@ identical once it is cleared.  The Piper and SmolLM2-135M projects regenerate
 byte-identical, weights included (apart from the timestamps).  Tests:
 scheduler 1927 (+7), chat 334, lint, facts.  No library changed, so no board
 run.
+
+## 31. Unseen models, step 4 — new numerics: Gemma 3 (2026-11-04)
+
+Steps 1–3 made a new Llama-family checkpoint work without code and gave
+other blocks a common builder.  Step 4 adds what the plain block lacked,
+driven by a real model: **Gemma-3-270M-it** (`unsloth/gemma-3-270m-it` @
+`23cf460f`, the ungated copy of `google/gemma-3-270m-it`, Gemma terms of use;
+268 M parameters, 170 M of them the 262 144 × 640 tied embedding).  It needs
+six things the stack did not have — and fits the board with room to spare
+(pool 548 MiB).
+
+| Gemma 3 | how |
+|---|---|
+| RMSNorm weights stored as w − 1 (x̂ · (1 + w)) | folded once: `llm_weights.Prepared` returns float32(1 + w) for every norm |
+| the embedding times √hidden | a float32 product at the lookup (`LlmEmbed` `axi_scale`, as torch's), the bf16 table kept (half the host memory of a scaled f32 one); Granite's multiplier moved there too |
+| an RMSNorm over every q / k head before RoPE (QK-norm, also Qwen3) | `LlmRMSNorm` of the q / k projections, rows of head_dim; the score scale (`query_pre_attn_scalar`, attention / yarn factors) folded into the q norm's weight, where a scale of W_q would be normed away |
+| RMSNorms of the attention and MLP outputs before their residual adds | `LlmRMSNorm` of the o / down projections; Gemma's pre-MLP norm is the plain block's |
+| a GELU-tanh gated MLP | `LlmGeluMul`: a 65 536-entry table per gate exponent, `g / (1 + exp(−2√(2/π)(g + 0.044715 g³)))` through libm exp only (as SiLU's) |
+| sliding-window layers (512 keys, 5 of every 6) with their own RoPE theta (10 000 against 1 000 000) | the mask `pos + t − W < j ≤ pos + t` in the attention softmax (`LlmAttnSoftmax` `window`, host; the unit's mask is a valid length); per-layer RoPE tables (`rope.cos` / `rope.local.cos`) |
+
+The config parser reads the new keys for the types that have them only
+(`TYPE_READ`, `WINDOW_TYPES`: a Llama config with Gemma's keys or a short
+`sliding_window` is still refused), and refuses softcapping (Gemma 2),
+bidirectional attention, chunked layer types and an unknown activation.
+`llm_study.py validate-arch` gained three tiny blocks — Gemma 3 with a window
+of 8 that its 96-token sequence cuts, Gemma 3 with its own score scale and
+per-type RoPE parameters, Qwen3 — all 13 equal to transformers within float32
+precision; on the real checkpoint the float model equals torch's float32
+(logits within 5.6e-4 at |logit| 72, the 1024-token held-out text included;
+greedy 12 / 12 prompts identical).
+
+**The datapath.**  The row-ops unit takes the new norms: its NORM reads int16
+rows (an RTL fixture since phase 1), but its integer sum of squares wants one
+exponent per row, while a kernel output carries one per channel — `LlmWiden`
+(one COPY, int16 << (f_c − f[c]) into an int32 DMA tensor at the finest
+exponent, exact) feeds the int32 NORM, rows of head_dim for the head norms.
+GELU · up stays a host op (the unit's MULACT is SiLU's).  The unit's ROPE
+buffers heads of ≤ 128 dims; Gemma's are 256, so its attention prep (RoPE, the
+cache rows, the q image) runs on the host — policy `…+rowops+hprep`, no
+`drope`.  The softmax of the sliding layers is the host's in prefill too.
+
+**Numerics** (`llm_study.py study`, 12 chat prompts × 128 tokens and 3 ×
+1 024 WikiText-2 tokens; float perplexity 36.748):
+
+| policy | top-1 prompts / held-out | KL prompts / held-out | ppl | identical |
+|---|---|---|---|---|
+| bf16 (yardstick) | 0.982 / 0.980 | 0.0029 / 0.0012 | 36.739 | 8 / 12 |
+| pow2+sink+p12, as SmolLM2 | 0.943 / 0.949 | 0.028 / 0.020 | 37.175 | 4 / 12 |
+| … + xf5 + vc6 | 0.962 / 0.966 | 0.014 / 0.023 | 37.803 | 6 / 12 |
+| **… + xf5 + vc6 + a10** (the calibration policy) | **0.967 / 0.970** | **0.017 / 0.0051** | **36.963** | **5 / 12** |
+| … + a10 + vsmx + rowops + hprep (the library's) | 0.966 / 0.971 | 0.017 / 0.0063 | 37.037 | — |
+
+What broke and what fixed it (ablations, `llm_study.py ablate`):
+1. *Weights quantised alone: top-1 0.59.*  The kernels' fixed output shift
+   gives a weight the exponent f_out + 8 − f_in; Gemma's activations are large
+   (q0 to 464, the residual to 1.0e5) and its weights small (median 0.02), so
+   the linears feeding the new norms — given one exponent per tensor for the
+   unit's integer norm — kept 0–2 raw levels per weight.  Per-channel
+   exponents and `LlmWiden` (above) instead: top-1 0.87.
+2. *o_proj and the LM head starved.*  The P·V output sits at 2^-(12 + f_vc − 8)
+   and the final norm's output at 2^-8, both finer than their weights can
+   afford: the V cache capped at 2^-6 and xf at 2^-5 (`vc6`, `xf5`: a class's
+   exponent cap, `llm_study.policy_spec`'s modifiers) give the weights 2–3 bits.
+3. *Rare positions with a large KL.*  The held-out KL was dominated by a
+   handful of positions (one at KL 4.8; the 12 worst = 64 % of a window's sum,
+   median 0.001): the MLP's activation `a` at 2^-8 is coarse where GELU's
+   outputs are small; at 2^-10 (`a10`) they vanish, at 2^-12 the down
+   projection's weights lose too much (KL 2× worse).
+4. *The residual stream* reaches 1.0e5, beyond int32 at 2^-15: the
+   calibration now writes the stream's exponent where it must be coarser
+   (`res@L`: 13 for Gemma; SmolLM2 / stories15m keep 15 and their formats
+   files byte for byte, `llm_calibrate.py check` REPRODUCED), the deltas capped
+   at it.  A SiLU model's gate exponents are capped at the unit's 14.
+
+The answers read as float's (the capital, the tips, the multi-turn reply
+start identically; the word problem comes out right where float's stops at
+8); the held-out perplexity is 0.6 % above float's (bf16: −0.03 %) — GO, with
+the shipped policy `pow2+sink+p12+xf5+vc6+a10+vsmx+rowops+hprep`.
+
+**Policies by name.**  `llm_study.policy_spec` composes a policy from a base
+and modifiers — the formats' (`xN` / `x2N` / `aN` / `xfN` / `qN` / `kN` /
+`vcN` exponent caps, `mN` margin, `pN` P's exponent) and the execution's
+(`vsmx`, `rowops`, `drope`, `hprep`); the shipped names compose to their
+explicit entries.  A model's calibration policy is in `llm_models.json`
+(`formats.policy`), the library's is that plus the execution's
+(`llm_project.policy`), exported by `llm_policy()`.
+
+**Serving.**  Gemma's tokenizer has one added token past the model's rows
+(`<image_soft_token>` = 262 144): a library with fewer rows than the
+tokenizer is accepted where every extra id is an added special token — never
+sampled, refused in a prompt.  `onboard_check.py` reports the profile, the
+template and the vocabulary as the stack handles them now.
+
+**Gates.**  A model with a window shorter than its context adds the gate
+prompt `long-summary` (653 tokens: its prefill and decode steps attend
+through the cut).  On the host the library is bit-exact: `llm_sched_check.py` 4 / 4 prompts
+(factual with its second turn, summarise, multi-turn, long-summary — 652 tokens
+prefilled as 256 + 256 + 64 + 64 + 12 rows, 32 decode steps past position 512),
+every logits vector equal to the study's emulation of
+`pow2+sink+p12+xf5+vc6+a10+vsmx+rowops+hprep`; `llm_host_emu.py` (the generated
+C against software kernels): 5 × 33 logits vectors bit-exact, re-open
+identical, and with separate CPU / DDR copies (`--incoherent`: every cache
+sync around the host GELU, softmax and attention prep between the units'
+jobs) as well.
+
+**On the board** (production bitstream b4e63457057a, `llm_board.py --reopen`):
+5 / 5 runs bit-exact with the simulation (33 / 33 logits each, greedy tokens =
+the study's emulation; `BOARD GATE: logits bit-exact`), the library check
+clean (only `llm_*` exports, vocabulary 262 144, context 1024, re-open
+identical).
+
+| Gemma-3-270M-it | |
+|---|---|
+| decode | **87.7 ms / token** (11.4 tok/s; llama_fit projected ~191) |
+| prefill 16 / 64 / 256 | 137 / 178 / 565 ms; the 652-token prompt 1.61 s |
+| `llm_open` | 58 s cold (885 MB of weights from the SD card), 1.7 s warm |
+| CMA | 639 MB (lib check) – 710 MB (a first open): `cma_mb` 680 in `llm_models` (the pool formula's 591 is short) |
+
+**Served** (2026-11-04): `"llm_models": {"gemma-3-270m-it": {"cma_mb": 680}}` and
+the name in `server.backends` — eight models, none unavailable.  Through the
+API, greedy with the penalties off: "The capital of France is Paris." — the
+study's tokens, 16 prompt tokens, first token after 162 ms (59 s on the cold
+open), 11.2 tok/s; a second turn reuses its 23 cached tokens (first token
+176 ms, 10.4 tok/s); a prompt holding `<image_soft_token>` is refused
+(`invalid_value`).  The tokenizer.json (33 MB) loads in 5 s on the dev PC.
+
+**The library.**  `generate_llm_project.py --assets demo/chat/assets/gemma-3-270m-it`
+(206 s, 8.8 GB peak): pool 548 MiB (weights 523, KV caches 18 — one KV head of
+256 dims over 18 layers —, intermediates 7.1), host tables 322 MiB (the bf16
+embedding, 262 144 × 640), weight files 885 MB; 504 linears on the kernels,
+72 q·Kᵀ and 72 P·V calls on ConvKernel per project, the sliding layers' 63
+softmaxes on the host, the full layers' prefill softmax on VectorOPKernel's
+unit.  `llama_fit.py` projects ~5 tok/s decode.
+
+**Verification.**  The shipped models are unchanged: their 65 entry graphs
+hash as before (step 3's fingerprint), their formats reproduce
+(`llm_calibrate.py check`: SmolLM2-135M, 360M, stories15m), SmolLM2's policy
+names compose to their explicit entries.  Tests: `test_llama.py`'s
+`TestNewNumerics` (tiny Gemma 3 under three policies — host row ops, the unit's
+with the host prep, everything on the unit — simulation = study and generated
+C = simulation, a library call sequence past the window, the 2^-13 residual,
+Qwen3; the policy names; the formats rules), the guard's Gemma 3 / Qwen3
+cases (`test_llm_arch.py`), the backend's fewer-rows case.

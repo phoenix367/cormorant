@@ -205,8 +205,8 @@ sources, reversed channels and a finer output exponent stay host ops.
   (bertsquad-12) schedulable — [`BERT_PLAN.md`](../plans/BERT_PLAN.md).
 - **Llama-family decoder ops** (custom domain `axi.llm`, `src/llm_nodes.py`)
   — `LlmEmbed`, `LlmRMSNorm`, `LlmResAdd`, `LlmAttention` (RoPE + KV cache
-  + causal GQA attention as one float region), `LlmSiluMul`,
-  `LlmSelectRow`, `LlmDequant`, `LlmToHost`, and `LlmAttnPrep` / `LlmAttnSoftmax` /
+  + causal GQA attention as one float region), `LlmSiluMul`, `LlmGeluMul`,
+  `LlmSelectRow`, `LlmDequant`, `LlmToHost`, `LlmWiden`, and `LlmAttnPrep` / `LlmAttnSoftmax` /
   `LlmAttnMerge` around the prefill attention's ConvKernel calls; the graphs
   come from the Llama frontend
   (`src/llama.py`, [§Llama-family decoders](#llama-family-decoders)) with
@@ -292,7 +292,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1927 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1934 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1159,6 +1159,19 @@ Per layer: `x = RMSNorm(h)`, `q0 / k0 / v = MatMul(x)`, attention (below)
 logical `[C][KV·HD]` int16 states stored group-major `[KV][C][HD]` whose row
 0 is the precomputed position-0 sink; `pos` ≥ 1.
 
+Gemma 3 and Qwen3 (doc/plans/CHAT_PLAN.md §31) add to it: an RMSNorm of
+every q0 / k0 head before the attention (`LlmRMSNorm` over rows of head_dim;
+the score scale folded into the q norm's weight), RMSNorms of o and d before
+their adds (Gemma), `a = GeluMul(g, u)` (Gemma's GELU tanh), the embedding
+rows times √hidden (`LlmEmbed` `axi_scale`, float32), (1 + w) norm weights
+(folded by `src/llm_weights.py`), and sliding-window layers: their softmax
+masks the keys before `pos + t − W` (host, `window`) and they rotate with
+their own RoPE table (`rope.local.cos` / `.sin`).  Under `rowops` the norms of
+int16 kernel outputs read an exact int32 copy at the finest channel exponent
+(`LlmWiden`), the residual's exponent is the formats' (`res@L`, 13 for
+Gemma 3's 1e5-wide stream), and a head wider than 128 keeps the attention
+prep on the host (`uprep=False`, policy `…+hprep`).
+
 **Attention** (`LlamaFrontend(prefill_attn=...)`, doc/plans/CHAT_PLAN.md §16):
 
 * `"fpga"` (default; study policy `pow2+sink+p12+mix`): decode steps run
@@ -1213,17 +1226,18 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 
 | op | semantics |
 |---|---|
-| `LlmEmbed` | `h[t] = table[ids[t]]` from a host-memory table (bf16 when exact, else f32 — into the int32 residual int16 at its exponent when every value fits, `res32_table`; `weights/<name>.dat` when > 64 KiB), index clamped |
+| `LlmEmbed` | `h[t] = table[ids[t]]` from a host-memory table (bf16 when exact, else f32 — into the int32 residual int16 at its exponent when every value fits, `res32_table`; `weights/<name>.dat` when > 64 KiB), index clamped; with `axi_scale` (Gemma 3's √hidden, Granite's multiplier) the row times it as a float32 product (`llm_embed_scaled`; the table keeps its kind) |
 | `LlmResAdd` | `h' = float32((double)h + d)`; with `rowops=True` the residual is an int32 DMA tensor at 2^-15 and the add runs on the row-ops unit (`ResAddRoNode`, exact), as do `LlmRMSNorm` and `LlmSiluMul` (`RMSNormRoNode`, `SiluMulRoNode`) — [§Hardware Kernels, the row-ops unit](#hardware-kernels) |
-| `LlmRMSNorm` | `ss = Σ h²`, `r = 1 / sqrt(ss / n + ε)`, `y = (h·r)·γ` (γ float32) |
+| `LlmRMSNorm` | `ss = Σ h²`, `r = 1 / sqrt(ss / n + ε)`, `y = (h·r)·γ` (γ float32); h the float32 residual, or an int16 kernel output at its per-channel exponents (`llm_rmsnorm16`: Gemma 3's attention / MLP output norms, and its q / k head norms as rows of γ's length — W / n per row of width W).  With `rowops=True` such an input is first widened by `LlmWiden` (one COPY into an int32 DMA tensor at its finest exponent, `WidenRoNode`, exact) and the norm runs on the unit (`RMSNormRoNode`, rows of γ's length) |
 | `LlmAttention` | rows t < n: `RoPE(k0[t])` → K cache row `pos + t` at its exponent, `v[t]` re-rounded into the V cache; per (t, head): `RoPE(q)` in double, `s_j = dot8(q, k_j) · HD^-½` over keys `j ≤ pos + t` (8 lane sums over d ascending, combined `((0+1)+(2+3))+((4+5)+(6+7))`), `e_j = exp(s_j − max)`, `p_j = e_j / Σe`, `o = Σ_j p_j v_j`; rows ≥ n → 0; 4 host threads over (row, head).  A decode step (n = 1, `llm_attn_decode`) runs on all host threads in one pool dispatch, in phases separated by spin barriers — scores per (KV group, key quarter) with the group's heads sharing each K row, exp per (group, key quarter), Σe per head left to right, p per (group, key quarter), P·V per (group, lane quarter) — with the power-of-two cache scales folded out exactly (`q·2^-f` against the raw K row; P·V over raw V rows, scaled once, while p ≥ 2^-900) and NEON kernels on aarch64 (no FMA): bit-identical to the per-head code for any thread count |
 | `LlmSiluMul` | `a = silu(g)·u`, silu from a 65 536-entry double table per gate exponent (libm exp, exhaustively equal to the simulator's) |
+| `LlmGeluMul` | `a = gelu_tanh(g)·u` (Gemma 3), gelu from a 65 536-entry double table per gate exponent, `g / (1 + exp(K·(g + A·g³)))` with K = −2√(2/π), A = 0.044715 (libm exp, as SiLU's) — a host op under `rowops` too (the unit's MULACT is SiLU's) |
 | `LlmSelectRow` | `h_last = h[n − 1]` |
 | `LlmDequant` | `y = float32(raw · 2^-f[c])` |
 | `LlmToHost` | `y` (float32 host) = `x`, a float32 DMA tensor (the unit's DEQUANT output), invalidated and copied into the caller's buffer — RPU_PLAN A1 |
 | `LlmAttnPrep` | rows t < n: RoPE(k0) → K cache row `pos + t`, v → V cache (as LlmAttention); `RoPE(q0)` rounded at the per-head q exponent → the q·Kᵀ input image of every KV head, `x_g[c][kw·p + j] = q[t][h][(c/16)·16kw + j·16 + c%16]`, `p = (h mod G)·T + t` (rows ≥ n zero; blocks of 16 rows per head, one contiguous run per image row); then `llm_cache_flush` of rows `[0, keys)` of both caches — a decode step (no `n` input) flushes only its rows, `llm_cache_flush_rows` |
 | `LlmAttnScores` (ConvKernel) | `s_g[j][p] = floor(Σ_d K_g[j][d]·q_g[d][p] / 2^8)`, j < keys: MatMul on ConvKernel ([§MatMul on ConvKernel](#matmul-on-convkernel)) with weight = the K cache rows `[keys][HD]` of KV head g (`out_ch = keys`), x = the q image (`in_ch = HD/kw`, 1×kw), output `G·T` pixels |
-| `LlmAttnSoftmax` | per query column p = (h', t < n), keys j ≤ pos + t: `k = raw_max − raw`, `e = sexp_{f_s}[k]` (a 65 536-entry table per score exponent `f_s = f_q + f_k − 8`, `exp(−k·2^-f_s / √HD)`, libm), sum left to right, `P = round_half_even(e / sum · 2^f_p)` → `P_g[p][j]` (row stride keys), masked keys / rows 0.  Items of 32 columns (one line of a score row) are read once, transposed into a stack buffer, zig-zag over the threads; `e · (2^f_p / sum)` replaces the division except within 1e-7 of a rounding tie (then the exact quotient) — the same integers |
+| `LlmAttnSoftmax` | per query column p = (h', t < n), keys j ≤ pos + t (`window` W, a sliding layer: pos + t − W < j ≤ pos + t, `llm_attn_softmax_w`; host only — the unit's mask is a valid length): `k = raw_max − raw`, `e = sexp_{f_s}[k]` (a 65 536-entry table per score exponent `f_s = f_q + f_k − 8`, `exp(−k·2^-f_s / √HD)`, libm), sum left to right, `P = round_half_even(e / sum · 2^f_p)` → `P_g[p][j]` (row stride keys), masked keys / rows 0.  Items of 32 columns (one line of a score row) are read once, transposed into a stack buffer, zig-zag over the threads; `e · (2^f_p / sum)` replaces the division except within 1e-7 of a rounding tie (then the exact quotient) — the same integers |
 | `LlmAttnSoftmax` with `vsmx = 1` (VectorOPKernel, `LlmAttnSoftmaxVopNode`) | the prefill under policy `…+vsmx` (`LlamaFrontend(vsmx=True)`): per head h' one `OP_SOFTMAX_T` call — s_g columns `h'·T … +T` (row stride `G·T`) → P_g rows `h'·T … +T` at row stride keys, over keys = roundup(pos + n, Q), row t valid over keys `j < min(keys, pos + 1 + t)` (`smx_mask` valid0 = pos + 1, period = T); the integer softmax of `src/vectorop_smx.py` with Cm / Cs from f_s and 1/√HD.  Padded rows t ≥ n are computed too (they feed padded rows only); decode steps keep the host op |
 | `LlmAttnPV` (ConvKernel) | `o_g[p][d] = floor(Σ_j P_g[p][j]·V_g[j][d] / 2^8)`: weight = P (`out_ch = G·T`), x = the V cache image of KV head g (`in_ch = keys/K`, 1×K, stride (1, K)), output HD pixels |
 | `LlmAttnMerge` | `pv[t][(g·G + h')·HD + d] = o_g[h'·T + t][d]` (raw); **in place** where every o_g is a contiguous piece of pv — a decode step (T = 1): o_g = pv[g·G·HD …], so `CodeGenerator._merge_in_place` makes each o_g a view of pv at that offset (the P·V call writes there), the merge emits nothing and pv lives from the first P·V call (RPU_PLAN §13, A2.0: −0.26 / −0.54 ms per token on SmolLM2-135M / 360M); `AXI_INPLACE_MERGE=0` keeps the copy.  Prefill and vision rows interleave across the heads: with ConvKernel's y channel pattern (`kernels.conv.y_pattern`, `AXI_CONV_YPATTERN`; A2.4) each o_g is a patterned view of pv (`LlmAttnMergeNode.pattern_views`: offset g·G·HD, or r·(T/R)·H·HD + g·HD for a vision row split) and its P·V call writes through `run_conv_at_y()` — `y_cs = H·HD`, `y_cn = T`, `y_gs = HD` (one head per group: `y_cn = 0`); T a multiple of 16 |

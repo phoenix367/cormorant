@@ -32,6 +32,7 @@ from test_protocol import SchemaMixin
 
 TOKENIZER = os.path.join(CHAT, "assets", "smollm2-135m-instruct", "tokenizer.json")
 HAVE = os.path.exists(TOKENIZER)
+GEMMA_TOKENIZER = os.path.join(CHAT, "assets", "gemma-3-270m-it", "tokenizer.json")
 MID = "smollm2-135m-instruct"
 _TOK = []
 
@@ -360,6 +361,25 @@ class TestLibraryChecks(unittest.TestCase):
         with self.assertRaises(RuntimeError):           # known once open: the library is closed again
             b.load()
         self.assertEqual((eng.is_open, eng.close_count), (False, 1))
+
+    @unittest.skipUnless(os.path.exists(GEMMA_TOKENIZER), "demo/chat/assets/gemma-3-270m-it not fetched")
+    def test_fewer_rows_by_special_tokens(self):
+        """Gemma 3's tokenizer has one added token past the model's 262 144 rows
+        (<image_soft_token>): served — the sampler over the library's rows — and a
+        prompt that holds the token refused."""
+        import hf_tokenizer
+        t = hf_tokenizer.Tokenizer(GEMMA_TOKENIZER)
+        V = 262144
+        self.assertEqual(t.vocab_size, V + 1)
+        eng = ScriptedEngine(t.encode("Hi"), vocab_size=V)
+        b = Smollm2Backend(eng, GEMMA_TOKENIZER, sampler_lib="/nonexistent")
+        b.load_host()
+        b.load()
+        self.assertEqual((b.n_vocab, b.sampler.n), (V, V))
+        with self.assertRaises(BackendError) as cm:
+            b.prepare(req([("user", "look: <image_soft_token>")]))
+        self.assertIn("262144", str(cm.exception))
+        b.prepare(req([("user", "hi")]))
 
     def test_context_before_open(self):
         t = tok()

@@ -415,13 +415,15 @@ def main(argv=None) -> int:
     buckets = sorted(int(b) for b in args.buckets.split(","))
     vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"
     rowops = lp.rowops_default() if args.rowops == "auto" else args.rowops == "on"
-    drope = lp.drope_default(rowops) if args.drope == "auto" else args.drope == "on"
+    drope = None if args.drope == "auto" else args.drope == "on"      # auto: drope_default(rowops, cfg)
     vcfg = None
     if args.assets and vp.is_vlm(args.assets):
         if args.prefill_attn != "fpga":
             raise SystemExit("a VLM needs --prefill-attn fpga")
         m = vp.load(args.assets, args.formats, args.vision_formats, lazy=True)
         cfg, vcfg = m.tcfg, m.vcfg
+        fpol = lp.FORMATS_POLICY
+        drope = lp.drope_default(rowops, cfg) if drope is None else drope
         fe, fe_v = vp.frontends(m, ctx=args.context, name=args.model_name,
                                 decode_attn=args.decode_attn, vsmx=vsmx, rowops=rowops, drope=drope)
         formats_paths = m.formats_paths
@@ -434,6 +436,8 @@ def main(argv=None) -> int:
         del m
     else:
         cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats, lazy=True)
+        fpol = _fd.get("policy") or lp.FORMATS_POLICY      # the calibration policy the formats record
+        drope = lp.drope_default(rowops, cfg) if drope is None else drope
         fe = lp.frontend(cfg, W, fmt, ctx=args.context, name=args.model_name,
                          prefill_attn=args.prefill_attn, decode_attn=args.decode_attn, vsmx=vsmx,
                          rowops=rowops, drope=drope)
@@ -441,7 +445,8 @@ def main(argv=None) -> int:
         print(f"frontend: {cfg.L} layers, hidden {cfg.D}, heads {cfg.H}/{cfg.KV}, vocab {cfg.V}, "
               f"context {args.context}, buckets {buckets}, prefill on {args.prefill_engine}, "
               f"prefill attention {args.prefill_attn}, decode attention {args.decode_attn}, "
-              f"policy {lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope)}", flush=True)
+              f"policy {lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope, cfg, fpol)}",
+              flush=True)
         models = lp.entry_models(fe, buckets)
         read = W
         del W
@@ -475,14 +480,14 @@ def main(argv=None) -> int:
     with open(formats_paths[0]) as f:
         sink = int(json.load(f).get("sink_token", 1))          # the token the sink K / V rows are of
     emit_glue(out, mg, args.model_name, cfg, args.context, buckets, vcfg, sink=sink,
-              policy=lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope))
+              policy=lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope, cfg, fpol))
     patch_cmake(out, mg)
     layers = write_layers(out, mg)
     summary.update({
         "model": args.model_name, "context": args.context, "buckets": buckets,
         "prefill_engine": args.prefill_engine, "prefill_attn": args.prefill_attn,
         "decode_attn": args.decode_attn, "vsmx": vsmx, "rowops": rowops, "drope": drope,
-        "policy": lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope),
+        "policy": lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope, cfg, fpol),
         "assets": os.path.abspath(args.assets or lp.default_assets()),
         "formats": [os.path.abspath(p) for p in formats_paths] if vcfg else formats_paths[0],
         "config": {"layers": cfg.L, "hidden": cfg.D, "heads": cfg.H, "kv_heads": cfg.KV,

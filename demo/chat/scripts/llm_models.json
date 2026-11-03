@@ -93,6 +93,35 @@
         "kl_held": 0.000779,
         "identical": 1
       }
+    },
+    "gemma-3-270m-it": {
+      "repo": "unsloth/gemma-3-270m-it",
+      "revision": "23cf460f6bb16954176b3ddcc8d4f250501458a9",
+      "license": "gemma",
+      "files": {
+        "config.json": "2706d3533059c6e1086badab27cc234e8ca2228975c3f73eeaef7f57cb5ec1db",
+        "generation_config.json": "be9e552870ff18a6c6beb0f6811030509c040d641e6972ce53c2fb540bbb4ba0",
+        "model.safetensors": "700b710a9a99c295ed546647aa81cacf9f81f4c573ea2be613a0e2517a44afab",
+        "tokenizer.json": "4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795",
+        "tokenizer_config.json": "be2182df1ad0ea735d336418896eb06e5cc2f59136e7aaeac5de2ec2197742ac",
+        "special_tokens_map.json": "45a857d8a2495d0be30a5d2d6de03278195eb028b6e0b8efc248bfa697d65f05",
+        "chat_template.jinja": "af95fbef33b76a50e5f463ff9766f85ce84f5849d915c4bd6c1619d852ac3231",
+        "added_tokens.json": "50b2f405ba56a26d4913fd772089992252d7f942123cc0a034d96424221ba946"
+      },
+      "formats": {
+        "policy": "pow2+sink+p12+xf5+vc6+a10",
+        "sha256": "ad1236767915b342d50178fd634a258e174818d08ef7d057a9df85d530d550d5"
+      },
+      "study": {
+        "policy": "pow2+sink+p12+xf5+vc6+a10",
+        "ppl": 36.962501,
+        "float_ppl": 36.747954,
+        "top1_all": 0.967302,
+        "top1_resp": 0.985528,
+        "top1_held": 0.970349,
+        "kl_held": 0.005124,
+        "identical": 5
+      }
     }
   },
   "texts": {

@@ -63,7 +63,8 @@ class TestConfigGuard(unittest.TestCase):
                            ("rope_scaling", {"rope_type": "su", "factor": 32.0}),
                            ("rope_scaling", {"rope_type": "llama3", "factor": 32.0}),   # parameters missing
                            ("partial_rotary_factor", 0.3), ("sliding_window", 512),
-                           ("rope_interleaved", True), ("final_logit_softcapping", 30.0)):
+                           ("rope_interleaved", True), ("final_logit_softcapping", 30.0),
+                           ("attn_logit_softcapping", 50.0), ("use_bidirectional_attention", True)):
             with self.subTest(key=key):
                 p = problems({**SMOLLM2, key: value})
                 self.assertEqual(len(p), 1, p)
@@ -108,6 +109,51 @@ class TestConfigGuard(unittest.TestCase):
         self.assertEqual(c.rope_scaling["original_max_position_embeddings"], 4096)
         self.assertFalse(c.plain)
         self.assertEqual(problems({**SMOLLM2, "model_type": "mistral", "sliding_window": 4096}), [])
+
+    def test_new_numerics(self):
+        """CHAT_PLAN §31: Gemma 3's block (gemma-3-270m-it's config.json), Qwen3's head norms;
+        their own keys stay unknown to the other types."""
+        g3 = {"_sliding_window_pattern": 6, "architectures": ["Gemma3ForCausalLM"], "attention_bias": False,
+              "attention_dropout": 0.0, "attn_logit_softcapping": None, "bos_token_id": 2, "eos_token_id": 106,
+              "final_logit_softcapping": None, "head_dim": 256, "hidden_activation": "gelu_pytorch_tanh",
+              "hidden_size": 640, "initializer_range": 0.02, "intermediate_size": 2048,
+              "layer_types": (["sliding_attention"] * 5 + ["full_attention"]) * 3,
+              "max_position_embeddings": 32768, "model_type": "gemma3_text", "num_attention_heads": 4,
+              "num_hidden_layers": 18, "num_key_value_heads": 1, "pad_token_id": 0,
+              "query_pre_attn_scalar": 256, "rms_norm_eps": 1e-06, "rope_local_base_freq": 10000.0,
+              "rope_scaling": None, "rope_theta": 1000000.0, "sliding_window": 512, "torch_dtype": "bfloat16",
+              "transformers_version": "4.55.2", "unsloth_fixed": True, "use_bidirectional_attention": False,
+              "use_cache": True, "vocab_size": 262144}
+        self.assertEqual(problems(g3), [])
+        c = LlamaConfig.from_dict(g3)
+        self.assertEqual((c.act, c.norm_offset, c.qk_norm, c.post_norms), ("gelu_tanh", True, True, True))
+        self.assertEqual((c.HD, c.attn_mult, c.local_theta, c.theta), (256, None, 10000.0, 1e6))
+        self.assertEqual(c.emb_mult, float(np.float32(np.sqrt(640))))
+        self.assertEqual([c.layer_window(i) for i in range(6)], [512] * 5 + [None])
+        self.assertEqual([c.local_layer(i) for i in range(6)], [True] * 5 + [False])
+        self.assertFalse(c.plain)
+        # the pattern when layer_types is absent; a score scale other than head_dim's
+        c = LlamaConfig.from_dict({**{k: v for k, v in g3.items() if k != "layer_types"},
+                                   "query_pre_attn_scalar": 144})
+        self.assertEqual(c.layer_types, (("sliding",) * 5 + ("full",)) * 3)
+        self.assertEqual(c.attn_mult, 144 ** -0.5)
+        for key, value in (("hidden_activation", "gelu"), ("attn_logit_softcapping", 50.0),
+                           ("final_logit_softcapping", 30.0), ("use_bidirectional_attention", True),
+                           ("layer_types", ["chunked_attention"] * 18)):
+            with self.subTest(key=key):
+                self.assertTrue(any(key in x for x in problems({**g3, key: value})))
+        q3 = {**SMOLLM2, "model_type": "qwen3", "head_dim": 128, "max_window_layers": 28,
+              "use_sliding_window": False, "sliding_window": None, "layer_types": ["full_attention"] * 30}
+        self.assertEqual(problems(q3), [])
+        c = LlamaConfig.from_dict(q3)
+        self.assertEqual((c.qk_norm, c.post_norms, c.norm_offset, c.act, c.window), (True, False, False,
+                                                                                    "silu", None))
+        self.assertTrue(any("max_window_layers" in x
+                            for x in problems({**q3, "use_sliding_window": True, "sliding_window": 4096})))
+        # Gemma's keys mean nothing to a Llama (refused as unknown there)
+        for key, value in (("rope_local_base_freq", 10000.0), ("hidden_activation", "gelu_pytorch_tanh"),
+                           ("layer_types", ["full_attention"] * 30)):
+            self.assertTrue(any(key in x and "unknown" in x for x in problems({**SMOLLM2, key: value})), key)
 
     def test_defaults_and_unchecked(self):
         c = {k: v for k, v in SMOLLM2.items() if k not in ("num_key_value_heads", "rope_theta")}

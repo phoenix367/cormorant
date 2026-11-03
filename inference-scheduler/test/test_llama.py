@@ -411,9 +411,9 @@ class TestOtherShapes(unittest.TestCase):
     head_dim 64, FFN 2560 — its K = 2560 down-projection needs kw >= 3 on
     ConvKernel) and plain multi-head attention, 2 random layers each."""
 
-    def _run(self, cfg, seed, W=None, policy=G.MIX_POLICY, **fe_kw):
+    def _run(self, cfg, seed, W=None, policy=G.MIX_POLICY, formats=None, **fe_kw):
         W = W if W is not None else G.tiny_weights(cfg, seed)
-        formats = G.calibrate(cfg, W, n_seq=2, length=20)
+        formats = formats or G.calibrate(cfg, W, n_seq=2, length=20)
         fe = G.frontend(cfg, W, formats, ctx=48, name="shape", **fe_kw)
         gs = graphs(fe, {"decode": ("decode", 1, False), "prefill_16": ("prefill", 16, False),
                          "head": ("head", 1, False)})
@@ -501,6 +501,163 @@ class TestOtherShapes(unittest.TestCase):
             with self.subTest(name), mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
                 self._run(cfg, 6, W=W, policy="pow2+sink+p12+rowops+drope", decode_attn="fpga",
                           rowops=True, drope=True)
+
+
+class TestNewNumerics(unittest.TestCase):
+    """The blocks of doc/plans/CHAT_PLAN.md §31 — Gemma 3: (1 + w) norms, the
+    sqrt(hidden) embedding (a float32 product at the lookup), q / k head norms,
+    the attention / MLP output norms before their adds, GELU tanh * up, a
+    sliding layer (window 8, its own RoPE theta) beside a full one, a score
+    scale other than head_dim's; Qwen3's head norms — the simulation equal to
+    the study's emulation bit for bit, and the generated C to the simulation."""
+    GEMMA3 = dict(G.TINY, model_type="gemma3_text", hidden_size=96, hidden_activation="gelu_pytorch_tanh",
+                  query_pre_attn_scalar=24, sliding_window=8, rope_local_base_freq=100.0,
+                  layer_types=["sliding_attention", "full_attention"])
+    QWEN3 = dict(G.TINY, model_type="qwen3")
+    # (policy, frontend options): host row ops; the unit's row ops with the prep on the host
+    # (Gemma 3's 256-dim heads: hprep) and the unit's softmax on the full layer; everything on the unit
+    POLICIES = (("pow2+sink+p12", {}),
+                ("pow2+sink+p12+vsmx+rowops+hprep", dict(vsmx=True, rowops=True, uprep=False)),
+                ("pow2+sink+p12+rowops+drope", dict(rowops=True, drope=True)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.W = G.tiny_gemma_weights(cls.GEMMA3, 8)
+        cls.formats = G.calibrate(cls.GEMMA3, cls.W, n_seq=2, length=20)
+
+    def _run(self, *a, **kw):
+        return TestOtherShapes._run(self, *a, **kw)
+
+    def test_gemma3(self):
+        from src import _rowops_hw_config
+        from src.llm_nodes import LlmEmbedNode, LlmGeluMulNode
+        from src.rowops_nodes import RMSNormRoNode, WidenRoNode
+        from src.smx_nodes import LlmAttnSoftmaxVopNode
+        L = self.GEMMA3["num_hidden_layers"]
+        for pol, kw in self.POLICIES:
+            with self.subTest(pol), mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+                gs = self._run(self.GEMMA3, 8, W=self.W, policy=pol, formats=self.formats,
+                               decode_attn="fpga", **kw)
+                g = gs["prefill_16"]
+                emb = next(sn for sn in g.nodes if isinstance(sn, LlmEmbedNode))
+                self.assertEqual((emb.scale, emb.table.kind), (float(np.float32(np.sqrt(96))), "bf16"))
+                self.assertEqual(sum(isinstance(sn, LlmGeluMulNode) for sn in g.nodes), L)
+                smx = [sn for sn in g.nodes if isinstance(sn, (LlmAttnSoftmaxNode, LlmAttnSoftmaxVopNode))]
+                # layer 0 slides (the host's softmax with its window), layer 1 attends everything
+                self.assertEqual([getattr(sn, "window", 0) for sn in smx], [8, 8, 0, 0])
+                self.assertEqual(sum(isinstance(sn, LlmAttnSoftmaxVopNode) for sn in smx),
+                                 2 if kw.get("vsmx") else 0)
+                if kw.get("rowops"):            # q / k / o / d widened and normed on the unit
+                    self.assertEqual(sum(isinstance(sn, WidenRoNode) for sn in g.nodes), 4 * L)
+                    self.assertEqual(sum(isinstance(sn, RMSNormRoNode) for sn in g.nodes), 6 * L)
+                else:
+                    self.assertEqual(sum(isinstance(sn, LlmRMSNormNode) for sn in g.nodes), 6 * L)
+                for name in ("prefill_16", "decode"):
+                    cg = CodeGenerator(gs[name], model_path=f"gemma_{name}.onnx")
+                    with tempfile.TemporaryDirectory() as td:
+                        rc, out = host_emu.build_and_run(cg, td, threads=4, incoherent=True)
+                        self.assertEqual(rc, 0, out[-3000:])
+                        self.assertIn("test_inference PASSED", out)
+
+    def test_gemma3_library_sequence(self):
+        """The multi-entry project's C over prefill / decode calls past the window
+        (decode steps whose keys start beyond the sink), with the row ops on the unit."""
+        from src import _rowops_hw_config
+        with mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+            fe = G.frontend(self.GEMMA3, self.W, self.formats, ctx=48, name="gemma", decode_attn="fpga",
+                            vsmx=True, rowops=True, uprep=False)
+            gs = graphs(fe, {"decode": ("decode", 1, False), "prefill_16": ("prefill", 16, False),
+                             "head": ("head", 1, False)})
+            mg = MultiEntryGenerator(list(gs.items()), "gemma_tiny")
+            rng = np.random.default_rng(31)
+            calls = [("prefill_16", list(rng.integers(2, 256, 16)), 1, 16), ("head", [], 0, 0)]
+            calls += [("decode", [int(rng.integers(2, 256))], 17 + i, 1) for i in range(4)]
+            calls += [("prefill_16", list(rng.integers(2, 256, 9)) + [0] * 7, 21, 9), ("head", [], 0, 0),
+                      ("decode", [5], 30, 1)]
+            states = mg.initial_states()
+            want = []
+            for e, ids, p, n in calls:
+                feeds = {} if e == "head" else {f"{e}.ids": ids, f"{e}.pos": [p]}
+                if e.startswith("prefill"):
+                    feeds[f"{e}.n"] = [n]
+                out = mg.cgs[e]._forward_pass({k: np.asarray(v, np.float64) for k, v in feeds.items()},
+                                              states=states)
+                if e in ("head", "decode"):
+                    want.append(np.asarray(out[f"{e}.logits"], np.float32).reshape(-1))
+            with tempfile.TemporaryDirectory() as td:
+                got = run_calls(mg, td, calls, incoherent=True)
+        self.assertEqual(len(got), len(want))
+        for i, (x, y) in enumerate(zip(got, want, strict=True)):
+            np.testing.assert_array_equal(x.view(np.uint32), y.view(np.uint32), err_msg=f"logits {i}")
+
+    def test_gemma3_residual_bits(self):
+        """A residual the int32 stream cannot hold at 2^-15 (Gemma 3's reaches 1e5): the
+        calibration's coarser exponent ("res@L") for the stream, the deltas capped at it."""
+        from src import _rowops_hw_config
+        fm = {k: v for k, v in self.formats.items()}
+        ex = dict(fm["exponents"])
+        L = self.GEMMA3["num_hidden_layers"]
+        ex[f"res@{L}"] = 13
+        for li in range(L):
+            for cls in ("on", "dn"):
+                ex[f"{cls}@{li}"] = np.minimum(np.asarray(ex[f"{cls}@{li}"]), 13).tolist()
+        fm["exponents"] = ex
+        with mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+            gs = self._run(self.GEMMA3, 8, W=self.W, policy="pow2+sink+p12+rowops+drope", formats=fm,
+                           decode_attn="fpga", rowops=True, drope=True)
+        res = [t for t in gs["decode"]._tensors.values() if t.dma == "i32" and t.onnx_name.endswith(".h1")]
+        self.assertTrue(res and all(int(t.exp_channels(8)[0]) == 13 for t in res))
+
+    def test_policy_names(self):
+        """llm_study.policy_spec: a POLICIES name, or a base and modifiers — the composed
+        names of the shipped policies are their explicit entries."""
+        for name in ("pow2+sink+p12+vsmx", "pow2+sink+p12+vsmx+rowops", "pow2+sink+p12+rowops+drope",
+                     "pow2+sink+p12+vsmx+rowops+drope", "pow2+sink+p12+vsmx+rowops+hprep"):
+            parts = name.split("+")
+            pol = dict(study.POLICIES["pow2+sink+p12"])
+            for m in parts[3:]:
+                pol.update(study._MODS[m])
+                if pol.get("irope") is None:
+                    pol.pop("irope", None)
+            self.assertEqual(pol, study.policy_spec(name), name)
+        p = study.policy_spec("pow2+sink+p12+xf5+vc6+m4+p13+vsmx+rowops+hprep")
+        self.assertEqual((p["in_caps"], p["margin"], p["p_bits"], p["vsmx"], p["res_bits"], "irope" in p),
+                         ({"xf": 5, "vc": 6}, 4.0, 13, "prefill", 15, False))
+        for bad in ("pow2+sink+p12+wobble", "nothing+vsmx", "pow2+sink+p12+drope"):
+            with self.assertRaises(KeyError):
+                study.policy_spec(bad)
+
+    def test_formats(self):
+        """make_formats' new rules: the int32 residual's exponent where the stream outgrows
+        2^-15 (the deltas capped at it), the per-class caps, the kernel outputs a norm reads
+        within 16 bits of each other (one widening shift)."""
+        sc = G.study_cfg(self.GEMMA3)
+        fm = study.Model(self.W, sc, None)
+        cm = study.Model(self.W, sc, None, base=fm, sink=True, sink_model=fm, record_ch=True)
+        rng = np.random.default_rng(1)
+        study.teacher_forced(cm, np.concatenate([[1], rng.integers(2, sc.V, 19)]))
+        ch = dict(cm.stats.ch)
+        f = study.make_formats(study.policy_spec("pow2+sink+p12+xf5+vc6"), ch, self.W, sc)
+        L = sc.L
+        self.assertNotIn(("res", L), f)
+        self.assertLessEqual(int(np.max(f[("xf", L)])), 5)
+        self.assertTrue(all(int(np.max(f[("vc", l)])) <= 6 for l in range(L)))
+        for l in range(L):
+            for cls in ("q0", "k0", "o", "d"):
+                e = np.atleast_1d(f[(cls, l)])
+                self.assertLessEqual(int(e.max() - e.min()), study.WIDEN_BITS, (cls, l))
+        ch[("h", 0)] = ch[("h", 0)] * 0 + 1.0e5                         # Gemma 3's residual
+        f = study.make_formats(study.policy_spec("pow2+sink+p12"), ch, self.W, sc)
+        self.assertEqual(f[("res", L)], 13)
+        self.assertTrue(all(int(np.max(f[(c, l)])) <= 13 for l in range(L) for c in ("on", "dn")))
+
+    def test_qwen3(self):
+        from src import _rowops_hw_config
+        W = G.tiny_gemma_weights(self.QWEN3, 9)        # its q / k norms (stored as w: Qwen3 has no + 1)
+        W = {k: v for k, v in W.items() if "feedforward" not in k}
+        for pol, kw in (self.POLICIES[0], self.POLICIES[2]):
+            with self.subTest(pol), mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+                self._run(self.QWEN3, 9, W=W, policy=pol, decode_attn="fpga", **kw)
 
 
 class TestHostEmulation(unittest.TestCase):
@@ -740,7 +897,8 @@ def run_calls(mg, workdir, calls, incoherent=False):
              os.path.join(emu, "emu_common.h"): host_emu._COMMON,
              os.path.join(emu, "xvectoropkernel.h"): host_emu.vop_source(),
              os.path.join(emu, "xmatmulkernel.h"): host_emu._MM,
-             os.path.join(emu, "xconvkernel.h"): host_emu._CONV}
+             os.path.join(emu, "xconvkernel.h"): host_emu._CONV,
+             os.path.join(emu, "xrowopskernel.h"): host_emu._ROWOPS}
     V = mg.entries[0][1].output_tensors[0].numel
     body = []
     for k, (e, ids, p, n) in enumerate(calls):

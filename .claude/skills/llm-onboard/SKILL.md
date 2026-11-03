@@ -89,11 +89,18 @@ model's (`validate_text.py --model <name>`); serving is
 `stories_backend.py` (`/v1/completions` + a story chat) — a new base model
 needs only its own prompt texts and a backend tuple like `STORIES`.
 
+Blocks this path implements (`src/llm_arch.py` MODEL_TYPES, CHAT_PLAN §29, §31):
+llama, mistral, granite, phi3, gemma3_text ((1 + w) norms, the sqrt(hidden)
+embedding, q / k head norms, the attention / MLP output norms, a GELU-tanh MLP,
+sliding-window layers with their own RoPE theta) and qwen3 (head norms).  A
+head wider than 128 dims keeps the attention prep on the host (policy
+`...+rowops+hprep`, no drope); a sliding window shorter than the context adds
+the gate prompt `long-summary` (653 tokens) to the gates.
+
 Not possible on this path today (model-study route C, or a bitstream / CMA
-change): blocks with new numerics (q/k/v or MLP biases — Qwen2 —, LayerNorm,
-a GELU MLP, QK-norm, softcapping, a sliding window shorter than the context,
-MoE — `src/llm_arch.py` refuses them, and an unknown config key until it is
-listed as harmless in `HARMLESS`); pools
+change): q/k/v or MLP biases (Qwen2), LayerNorm, softcapping (Gemma 2), MoE —
+`src/llm_arch.py` refuses them, and an unknown config key until it is
+listed as harmless in `HARMLESS`; pools
 above ~920 MiB (≈ 440 M int16 params with the KV caches); K > 4096; a context
 not a multiple of 64 (the V cache's P·V image, `pv_kw` 4; 16 works at a lower
 P·V speed); another VLM

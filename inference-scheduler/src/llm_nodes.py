@@ -139,6 +139,11 @@ RUNTIME_GROUPS = {
               "_vit_sexp_slots", "vit_sexp_slot_t",
               "if (vit_sexp_table(T->f, T->scale) != 0) return -1;",
               "vit_sexp_free(T->f);"),
+    "lgelu": ("typedef struct {\n    int f;                          /* a gate exponent */\n"
+              "} llm_gelu_slot_t;",
+              "_llm_gelu_slots", "llm_gelu_slot_t",
+              "if (llm_gelu_table(T->f) != 0) return -1;",
+              "llm_gelu_free(T->f);"),
     "gelu":  ("typedef struct {\n    int fx, fa;                     /* GELU input / output exponents */\n"
               "} vit_gelu_slot_t;",
               "_vit_gelu_slots", "vit_gelu_slot_t",
@@ -268,6 +273,13 @@ def silu_item(f: int) -> RuntimeItem:
     return RuntimeItem(key=f"silu:{f}", decl="", group="silu", row=f"{{ {int(f)} }}")
 
 
+def gelu_item(f: int) -> RuntimeItem:
+    """The GELU-tanh table of gate exponent f (LlmGeluMul; SILU_EMIN's range)."""
+    if not SILU_EMIN <= int(f) < SILU_EMIN + SILU_NE:
+        raise SchedulerError(f"gate exponent {f} outside [{SILU_EMIN}, {SILU_EMIN + SILU_NE})")
+    return RuntimeItem(key=f"lgelu:{f}", decl="", group="lgelu", row=f"{{ {int(f)} }}")
+
+
 # ------------------------------------------------------------------ #
 # Numerics shared by reference() implementations                       #
 # ------------------------------------------------------------------ #
@@ -321,7 +333,24 @@ def silu_table(f: int) -> np.ndarray:
     return t
 
 
+# GELU tanh as llm_study.gelu_table: g / (1 + exp(GELU_K * (g + GELU_A * g * g * g)))
+GELU_K, GELU_A = -1.5957691216057308, 0.044715
+
+
+def gelu_table(f: int) -> np.ndarray:
+    """gelu_tanh(g) for every raw int16 r, g = (r + 0.0) / 2^f (index r + 32768;
+    0 where z >= 700), libm exp — llm_study.gelu_table, the C fill's order."""
+    t = np.empty(65536)
+    d = 2.0 ** f
+    for i in range(65536):
+        g = (i - 32768 + 0.0) / d
+        z = GELU_K * (g + GELU_A * g * g * g)
+        t[i] = g / (1.0 + math.exp(z)) if z < 700.0 else 0.0
+    return t
+
+
 _SILU_CACHE: Dict[int, np.ndarray] = {}
+_GELU_CACHE: Dict[int, np.ndarray] = {}
 _SEXP_CACHE: Dict[Tuple[int, float], np.ndarray] = {}
 
 
@@ -339,6 +368,12 @@ def _silu(f: int) -> np.ndarray:
     if f not in _SILU_CACHE:
         _SILU_CACHE[f] = silu_table(f)
     return _SILU_CACHE[f]
+
+
+def _gelu(f: int) -> np.ndarray:
+    if f not in _GELU_CACHE:
+        _GELU_CACHE[f] = gelu_table(f)
+    return _GELU_CACHE[f]
 
 
 # ------------------------------------------------------------------ #
@@ -435,12 +470,16 @@ class LlmEmbedNode(LlmNode):
     select image row id - rows (the index clamped to [0, rows + R)).  Into
     the int32 residual without image rows, an f32 table whose values all fit
     is stored as int16 at the residual's exponent (``res32_table``: the same
-    raw values, half the host memory — stories15m's float16 checkpoint)."""
+    raw values, half the host memory — stories15m's float16 checkpoint).
+    ``axi_scale`` (a float32 as text): the rows times it, a float32 product
+    (Gemma's sqrt(hidden), Granite's embedding multiplier; the table keeps its
+    kind — a bf16 table stays bf16)."""
     rows:       int = 1
     d:          int = 1
     n:          int = 1
     image_rows: int = 0
     res32:      bool = False                      # the output is the int32 DMA residual
+    scale:      float = 1.0
     table: Optional[HostTable] = field(default=None, repr=False)
 
     @classmethod
@@ -453,14 +492,18 @@ class LlmEmbedNode(LlmNode):
         _require(tab.ndim == 2, node, "table must be 2-D [rows][d]")
         rows, d = tab.shape
         name = "_llm_tab_" + tensors[node.input[1]].c_name
+        sc = _attrs(node).get("axi_scale")
+        scale = float(sc.decode() if isinstance(sc, bytes) else sc) if sc is not None else 1.0
+        _require(scale == float(np.float32(scale)) and scale > 0.0, node, "axi_scale must be a float32")
+        _require(scale == 1.0 or img is None, node, "axi_scale with image rows is not implemented")
         sn = cls(onnx_node=node, inputs=[ids] + ([img] if img is not None else []), output=y,
                  index=index, align_elems=align_elems, rows=int(rows), d=int(d), n=ids.numel,
-                 image_rows=img.numel // int(d) if img is not None else 0,
+                 image_rows=img.numel // int(d) if img is not None else 0, scale=scale,
                  table=HostTable(name, table_kind(tab), np.asarray(tab, np.float32)),
                  F=ctx.frac_bits)
         sn._want(ids, "i32", "ids")
         sn.res32 = sn._want_residual(y, "output")
-        if sn.res32 and img is None:
+        if sn.res32 and img is None and scale == 1.0:
             sn.table = res32_table(sn.table, y.exp_channels(sn.F))
         if img is not None:
             if img.dma != "f32":                    # float32 host, or the unit's DEQUANT output (DMA)
@@ -470,6 +513,8 @@ class LlmEmbedNode(LlmNode):
         return sn
 
     def c_helpers(self):
+        if self.scale != 1.0:
+            return ("llm", "llm_ext")
         return ("llm", "vit") if self.image_rows else ("llm",)
 
     def tables(self):
@@ -477,9 +522,16 @@ class LlmEmbedNode(LlmNode):
 
     def describe(self):
         return (f"{self.n} rows of {self.d} from a [{self.rows}] {self.table.kind} host table"
-                + (f" + {self.image_rows} image rows" if self.image_rows else ""))
+                + (f" + {self.image_rows} image rows" if self.image_rows else "")
+                + (f", times {self.scale!r}" if self.scale != 1.0 else ""))
 
     def c_call(self, ins, out, scratch, direct, dtype):
+        if self.scale != 1.0:
+            bf = self.table.kind == "bf16"
+            t16, t32 = (self.table.name, "NULL") if bf else ("NULL", self.table.name)
+            f = int(self.output.exp_channels(self.F)[0]) if self.res32 else 0
+            return [f"llm_embed_scaled({ins[0]}, {self.n}u, {t16}, {t32}, {self.rows}u, {self.d}u, "
+                    f"{_c_float(self.scale)}, {int(self.res32)}, {f}, {out});"]
         if self.table.kind == "i16":
             return [f"llm_embed16({ins[0]}, {self.n}u, {self.table.name}, {self.rows}u, {self.d}u, {out});"]
         bf = self.table.kind == "bf16"
@@ -498,7 +550,9 @@ class LlmEmbedNode(LlmNode):
             out = q[np.clip(k, 0, self.rows - 1)] / np.power(2.0, self.output.exp_channels(self.F))[None, :]
             return out.reshape(self.output.shape)
         tab = np.asarray(self.table.data, np.float32).reshape(self.rows, self.d)
-        if not self.image_rows:
+        if self.scale != 1.0:                       # the float32 product (llm_study emb_rows)
+            out = (tab[np.clip(k, 0, self.rows - 1)] * np.float32(self.scale)).astype(np.float64)
+        elif not self.image_rows:
             out = tab[np.clip(k, 0, self.rows - 1)].astype(np.float64)
         else:
             img = np.asarray(ins[1], np.float32).reshape(self.image_rows, self.d)
@@ -563,9 +617,15 @@ def norm_eps(a: dict) -> float:
 @dataclass
 class LlmRMSNormNode(LlmNode):
     """y = (h * r) * gamma, r = 1 / sqrt(sum(h^2) / n + eps) per row;
-    gamma float32 (a host-side constant)."""
+    gamma float32 (a host-side constant).  h: the float32 residual, or an
+    int16 DMA tensor (a kernel output: Gemma's norms of the attention / MLP
+    outputs, the q / k head norms) — then rows of gamma's length n, each
+    width W row of h as W / n of them (the heads), h at its per-channel
+    exponents."""
     rows:  int = 1
     n:     int = 1
+    W:     int = 1                                # h's row (a multiple of n)
+    i16:   bool = False
     eps:   float = 1e-5
     gamma: Optional[np.ndarray] = field(default=None, repr=False)
 
@@ -573,16 +633,19 @@ class LlmRMSNormNode(LlmNode):
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
         h = _resolve(tensors, node.input[0], node)
         y = _resolve(tensors, node.output[0], node)
-        n = int(h.shape[-1])
+        W = int(h.shape[-1])
         g = _const_array(ctx, tensors, node.input[1], node, "gamma").astype(np.float32).reshape(-1)
-        _require(g.size == n, node, "gamma size")
+        i16 = h.dma is None and h.host is None
+        n = g.size if i16 else W
+        _require(g.size == n and W % n == 0, node, "gamma size")
         eps = norm_eps(_attrs(node))
         sn = cls(onnx_node=node, inputs=[h], output=y, index=index, align_elems=align_elems,
-                 rows=h.numel // n, n=n, eps=eps, gamma=g.copy(),
+                 rows=h.numel // n, n=n, W=W, i16=i16, eps=eps, gamma=g.copy(),
                  F=ctx.frac_bits)
-        sn._want(h, "f32", "h")
+        if not i16:
+            sn._want(h, "f32", "h")
         sn._want(y, None, "output")
-        _require(y.numel == h.numel, node, "shapes")
+        _require(y.numel == h.numel and int(y.shape[-1]) == W, node, "shapes")
         return sn
 
     @property
@@ -595,17 +658,30 @@ class LlmRMSNormNode(LlmNode):
         return [RuntimeItem(key=f"gamma:{self.gamma_name}",
                             decl=(f"static const float {self.gamma_name}[{self.gamma.size}] = "
                                   f"{{\n{rows}\n}};")),
-                self._scales(self.output)[2]]
+                self._scales(self.output)[2]] + ([self._scales(self.inputs[0])[2]] if self.i16 else [])
+
+    def c_helpers(self):
+        return ("llm", "llm_ext") if self.i16 else ("llm",)
 
     def describe(self):
-        return f"rows={self.rows} n={self.n} eps={self.eps:.3g}"
+        return f"rows={self.rows} n={self.n} eps={self.eps:.3g}" + (" (int16 in)" if self.i16 else "")
 
     def c_call(self, ins, out, scratch, direct, dtype):
         _s, i, _ = self._scales(self.output)
+        if self.i16:
+            sx = self._scales(self.inputs[0])[0]
+            return [f"llm_rmsnorm16({ins[0]}, {sx}, {self.rows * self.n // self.W}u, {self.W}u, "
+                    f"{self.n}u, {self.gamma_name}, {_c_double(self.eps)}, {i}, {out});"]
         return [f"llm_rmsnorm({ins[0]}, {self.rows}u, {self.n}u, {self.gamma_name}, "
                 f"{_c_double(self.eps)}, {i}, {out});"]
 
     def reference(self, ins, dtype):
+        if self.i16:                                # rows of n: the output's exponents per channel of W
+            h = np.asarray(ins[0], np.float64).reshape(-1, self.n)
+            ss = np.cumsum(h * h, axis=-1)[:, -1]
+            r = 1.0 / np.sqrt(ss / float(self.n) + self.eps)
+            y = ((h * r[:, None]) * self.gamma.astype(np.float64)[None, :]).reshape(-1, self.W)
+            return _st(dtype, y, self.output.exp_channels(self.F)[None, :]).reshape(self.output.shape)
         h = np.asarray(ins[0], np.float64).reshape(self.rows, self.n)
         ss = np.cumsum(h * h, axis=-1)[:, -1]
         r = 1.0 / np.sqrt(ss / float(self.n) + self.eps)
@@ -666,6 +742,47 @@ class LlmSiluMulNode(LlmNode):
             idx = np.floor(g[:, cols] * 2.0 ** int(f)).astype(np.int64) + 32768
             sil[:, cols] = _silu(int(f))[idx]
         return _st(dtype, sil * u, self.output.exp_channels(self.F)[None, :]).reshape(
+            self.output.shape)
+
+
+@dataclass
+class LlmGeluMulNode(LlmSiluMulNode):
+    """a = gelu_tanh(g) * u (Gemma's MLP), gelu from a table over g's raw int16
+    per gate exponent (llm_study.gelu_mul)."""
+    helpers: ClassVar[Tuple[str, ...]] = ("llm", "llm_ext")
+
+    def c_runtime(self):
+        fg = self.inputs[0].exp_channels(self.F)
+        items = [gelu_item(int(f)) for f in sorted(set(int(v) for v in fg))]
+        items.append(self._scales(self.inputs[0])[2])
+        items.append(self._scales(self.inputs[1])[2])
+        items.append(self._scales(self.output)[2])
+        return items
+
+    def c_helpers(self):
+        return self.helpers
+
+    def describe(self):
+        fg = sorted(set(int(v) for v in self.inputs[0].exp_channels(self.F)))
+        return f"rows={self.rows} n={self.n} gelu tables for gate exponents {fg}"
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        su = self._scales(self.inputs[1])[0]
+        ia = self._scales(self.output)[1]
+        eg = "_llm_e_" + exp_tag(self.inputs[0].exp_channels(self.F))
+        return [f"llm_gelu_mul({ins[0]}, {ins[1]}, {eg}, {su}, {ia}, "
+                f"{self.rows}u, {self.n}u, {out});"]
+
+    def reference(self, ins, dtype):
+        g = np.asarray(ins[0], np.float64).reshape(self.rows, self.n)
+        u = np.asarray(ins[1], np.float64).reshape(self.rows, self.n)
+        fg = self.inputs[0].exp_channels(self.F)
+        gl = np.empty_like(g)
+        for f in np.unique(fg):
+            cols = fg == f
+            idx = np.floor(g[:, cols] * 2.0 ** int(f)).astype(np.int64) + 32768
+            gl[:, cols] = _gelu(int(f))[idx]
+        return _st(dtype, gl * u, self.output.exp_channels(self.F)[None, :]).reshape(
             self.output.shape)
 
 
@@ -1308,7 +1425,9 @@ class LlmAttnSoftmaxNode(LlmNode):
     valid row, which alone attends its own key, is vla_nodes.VlaStateAttn's;
     vsmx = 1 only);
     ``logit_scale`` — the scores' scale (default head_dim^-1/2; a model whose
-    heads are padded for the kernels keeps its own head dim's)."""
+    heads are padded for the kernels keeps its own head dim's); ``window`` W
+    (a sliding layer, Gemma 3) — row t over the keys pos + t - W < j <= pos + t
+    (host only)."""
     T:     int = 1
     G:     int = 1
     C:     int = 16
@@ -1320,6 +1439,7 @@ class LlmAttnSoftmaxNode(LlmNode):
     has_n: bool = True                                               # False: n = T (decode)
     causal: bool = True                                              # False: rows over keys < pos + n
     prefix_lm: bool = False                                          # causal 2: rows over keys < pos + n - 1
+    window: int = 0                                                  # a sliding window (0: none)
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
@@ -1342,7 +1462,9 @@ class LlmAttnSoftmaxNode(LlmNode):
                  scale=scale, has_n=n is not None, causal=int(a.get("causal", 1)) == 1,
                  prefix_lm=int(a.get("causal", 1)) == 2,
                  fs=np.asarray(_attr_ints(a, "s_exp", node, G), np.int64),
-                 fp=np.asarray(_attr_ints(a, "p_exp", node, G), np.int64), F=ctx.frac_bits)
+                 fp=np.asarray(_attr_ints(a, "p_exp", node, G), np.int64), F=ctx.frac_bits,
+                 window=int(a.get("window", 0)))
+        _require(sn.window >= 0 and (not sn.window or sn.causal), node, "window: causal rows only")
         sn._want(s, None, "scores")
         sn._want(y, None, "output")
         sn._want(pos, "i32", "pos")
@@ -1350,6 +1472,7 @@ class LlmAttnSoftmaxNode(LlmNode):
             sn._want(n, "i32", "n")
         from .smx_nodes import LlmAttnSoftmaxVopNode, vsmx_attr
         if vsmx_attr(node):                       # the vsmx policy: VectorOP's softmax unit
+            _require(not sn.window, node, "window: the unit's mask is a valid length (host only)")
             return LlmAttnSoftmaxVopNode.from_host(sn, node)
         _require(sn.causal, node, "causal = 0 / 2 runs on VectorOPKernel's softmax unit only (vsmx = 1)")
         return sn
@@ -1363,10 +1486,26 @@ class LlmAttnSoftmaxNode(LlmNode):
     def describe(self):
         return (f"group {self.group}: {self.G}x{self.T} query columns, score exponents "
                 f"{[int(v) for v in self.fs]}, P at 2^-{[int(v) for v in self.fp]}"
-                + ("" if self.causal else ", every row over the keys < pos + n"))
+                + ("" if self.causal else ", every row over the keys < pos + n")
+                + (f", window {self.window}" if self.window else ""))
+
+    def c_helpers(self):
+        return ("llm", "llm_ext") if self.window else ("llm",)
 
     def c_call(self, ins, out, scratch, direct, dtype):
         ip = scale_item(self.fp)[1]
+        if self.window:
+            return [
+                "{",
+                "    llm_smxw_t _a;",
+                f"    _a.s = {ins[0]}; _a.p = {out}; _a.fs = _llm_e_{exp_tag(self.fs)}; _a.ip = {ip};",
+                f"    _a.pos = (unsigned){ins[1]}[0]; _a.n = "
+                + (f"(unsigned){ins[2]}[0]" if self.has_n else f"{self.T}u") + ";",
+                f"    _a.T = {self.T}u; _a.G = {self.G}u; _a.C = {self.C}u; _a.Q = {self.Q}u; "
+                f"_a.W = {self.window}u;",
+                "    llm_attn_softmax_w(&_a);",
+                "}",
+            ]
         return [
             "{",
             "    llm_smx_t _a;",
@@ -1390,6 +1529,8 @@ class LlmAttnSoftmaxNode(LlmNode):
         j = np.arange(S)[None, :]
         t = np.arange(n)[:, None]
         mask = j <= pos + t                                     # [n][S]
+        if self.window:
+            mask &= j > pos + t - self.window
         for hh in range(G):
             raw = s[:S, hh * T:hh * T + n].T.astype(np.int64)   # [n][S]
             m = np.where(mask, raw, -(1 << 20)).max(-1, keepdims=True)
@@ -1628,6 +1769,7 @@ LLM_OP_FACTORIES = {
     "LlmResAdd":    LlmResAddNode.from_onnx_node,
     "LlmRMSNorm":   LlmRMSNormNode.from_onnx_node,
     "LlmSiluMul":   LlmSiluMulNode.from_onnx_node,
+    "LlmGeluMul":   LlmGeluMulNode.from_onnx_node,
     "LlmAttention": LlmAttentionNode.from_onnx_node,
     "LlmSelectRow": LlmSelectRowNode.from_onnx_node,
     "LlmDequant":   LlmDequantNode.from_onnx_node,
@@ -2975,15 +3117,266 @@ static void llm_cache_inval_rows(inference_buf_t *cache, unsigned r0, unsigned n
 """
 
 
+LLM_EXT_C = r"""/*
+ * Host ops of the newer Llama-family blocks (llm_ext_c_helpers, doc/plans/CHAT_PLAN.md
+ * §31; after the LLM helpers): the embedding rows times a float32 multiplier, the
+ * RMSNorm of an int16 tensor (Gemma's attention / MLP output norms and q / k head
+ * norms), GELU tanh * up, the attention softmax of a sliding layer.  Every operation
+ * order is demo/chat/scripts/llm_study.py's.
+ */
+
+/* ---- LlmEmbed with axi_scale: float32(row * scale), into the float32 or int32 residual ---- */
+typedef struct {
+    const int32_t  *ids;
+    const uint16_t *t16;
+    const float    *t32;
+    unsigned        rows, d;
+    float           scale;
+    int             res32;
+    double          sc;             /* 2^f of the int32 residual */
+    void           *h;
+} llm_embeds_t;
+
+static void llm_embeds_range(void *p, unsigned t0, unsigned t1)
+{
+    const llm_embeds_t *a = (const llm_embeds_t *)p;
+    unsigned t, i;
+    for (t = t0; t < t1; t++) {
+        long k = (long)a->ids[t];
+        if (k < 0) k = 0;
+        if (k >= (long)a->rows) k = (long)a->rows - 1;
+        for (i = 0u; i < a->d; i++) {
+            float v;
+            if (a->t16) {
+                uint32_t u = (uint32_t)a->t16[(size_t)k * a->d + i] << 16;
+                memcpy(&v, &u, sizeof v);
+            } else {
+                v = a->t32[(size_t)k * a->d + i];
+            }
+            v = v * a->scale;                                   /* the float32 product */
+            if (a->res32)
+                ((int32_t *)a->h)[(size_t)t * a->d + i] = llm_st32((double)v * a->sc);
+            else
+                ((float *)a->h)[(size_t)t * a->d + i] = v;
+        }
+    }
+}
+
+static void llm_embed_scaled(const int32_t *ids, unsigned n, const uint16_t *t16, const float *t32,
+                             unsigned rows, unsigned d, float scale, int res32, int f, void *h)
+{
+    llm_embeds_t a;
+    a.ids = ids; a.t16 = t16; a.t32 = t32; a.rows = rows; a.d = d; a.scale = scale;
+    a.res32 = res32; a.sc = ldexp(1.0, f); a.h = h;
+    host_parallel(llm_embeds_range, &a, n, host_row_grain(d), 1u);
+}
+
+/* ---- LlmRMSNorm of an int16 tensor: every row of W as W / n rows of n ---- */
+typedef struct {
+    const Data_t *x;
+    const double *sx;               /* 2^-f per channel of W */
+    unsigned      W, n;
+    const float  *gamma;            /* [n] */
+    double        eps;
+    const double *iy;               /* 2^f per channel of W */
+    Data_t       *y;
+} llm_rms16_t;
+
+static void llm_rms16_rows(void *p, unsigned r0, unsigned r1)
+{
+    const llm_rms16_t *a = (const llm_rms16_t *)p;
+    unsigned r, g, c;
+    for (r = r0; r < r1; r++) {
+        const Data_t *x = a->x + (size_t)r * a->W;
+        Data_t       *y = a->y + (size_t)r * a->W;
+        for (g = 0u; g < a->W; g += a->n) {
+            double ss = 0.0, rr;
+            for (c = 0u; c < a->n; c++) {
+                const double v = llm_ld(x[g + c], a->sx[g + c]);
+                ss += v * v;
+            }
+            rr = 1.0 / sqrt(ss / (double)a->n + a->eps);
+            for (c = 0u; c < a->n; c++)
+                y[g + c] = llm_st((llm_ld(x[g + c], a->sx[g + c]) * rr) * (double)a->gamma[c],
+                                  a->iy[g + c]);
+        }
+    }
+}
+
+static void llm_rmsnorm16(const Data_t *x, const double *sx, unsigned rows, unsigned W, unsigned n,
+                          const float *gamma, double eps, const double *iy, Data_t *y)
+{
+    llm_rms16_t a;
+    a.x = x; a.sx = sx; a.W = W; a.n = n; a.gamma = gamma; a.eps = eps; a.iy = iy; a.y = y;
+    host_parallel(llm_rms16_rows, &a, rows, host_row_grain(W), 1u);
+}
+
+/* ---- LlmGeluMul: a = gelu_tanh(g) * u, gelu tabulated over g's raw int16:
+ * g / (1 + exp(K (g + A g^3))), 0 where the exponent reaches 700 ---- */
+#define LLM_GELU_K  (GELU_K_VALUE)
+#define LLM_GELU_A  (GELU_A_VALUE)
+static double *_llm_gelu_tab[LLM_SILU_NE];
+
+static void llm_gelu_fill(void *p, unsigned i0, unsigned i1)
+{
+    const llm_silu_fill_t *a = (const llm_silu_fill_t *)p;
+    unsigned i;
+    for (i = i0; i < i1; i++) {
+        double g = ((double)((int)i - 32768) + 0.0) / a->d;
+        double z = LLM_GELU_K * (g + LLM_GELU_A * g * g * g);
+        a->t[i] = z < 700.0 ? g / (1.0 + exp(z)) : 0.0;
+    }
+}
+
+static int llm_gelu_table(int f)
+{
+    llm_silu_fill_t a;
+    double        **t = &_llm_gelu_tab[f - LLM_SILU_EMIN];
+    if (*t) return 0;
+    *t = (double *)malloc(65536u * sizeof(double));
+    if (!*t) return -1;
+    a.t = *t; a.d = ldexp(1.0, f);
+    host_parallel(llm_gelu_fill, &a, 65536u, 1024u, 8u);
+    return 0;
+}
+
+static void llm_gelu_free(int f)
+{
+    free(_llm_gelu_tab[f - LLM_SILU_EMIN]);
+    _llm_gelu_tab[f - LLM_SILU_EMIN] = NULL;
+}
+
+static void llm_gelu_rows(void *p, unsigned r0, unsigned r1)
+{
+    const llm_silu_t *a = (const llm_silu_t *)p;
+    unsigned r, c;
+    for (r = r0; r < r1; r++) {
+        const Data_t *g = a->g + (size_t)r * a->n;
+        const Data_t *u = a->u + (size_t)r * a->n;
+        Data_t       *y = a->y + (size_t)r * a->n;
+        for (c = 0u; c < a->n; c++)
+            y[c] = llm_st(_llm_gelu_tab[a->fg[c] - LLM_SILU_EMIN][(int)(int16_t)g[c] + 32768]
+                          * llm_ld(u[c], a->su[c]), a->ia[c]);
+    }
+}
+
+static void llm_gelu_mul(const Data_t *g, const Data_t *u, const signed char *fg,
+                         const double *su, const double *ia, unsigned rows, unsigned n,
+                         Data_t *y)
+{
+    llm_silu_t a;
+    a.g = g; a.u = u; a.fg = fg; a.su = su; a.ia = ia; a.n = n; a.y = y;
+    host_parallel(llm_gelu_rows, &a, rows, host_row_grain(n), 1u);
+}
+
+/* ---- LlmAttnSoftmax of a sliding layer (window W): llm_smx_items with column
+ * p = h' * T + t over the keys pos + t - W < j <= pos + t, the others 0 ---- */
+typedef struct {
+    const Data_t      *s;
+    Data_t            *p;
+    const signed char *fs;          /* score exponent per head of the group */
+    const double      *ip;          /* 2^f_p per head of the group */
+    unsigned           pos, n, T, G, C, Q, W, keys, nblk;
+} llm_smxw_t;
+
+static void llm_smxw_items(void *pp, unsigned i0, unsigned i1)
+{
+    const llm_smxw_t *a = (const llm_smxw_t *)pp;
+    const unsigned    GT = a->G * a->T, keys = a->keys, nb = a->nblk;
+    unsigned          it;
+    for (it = i0; it < i1; it++) {
+        const unsigned b = (it & 1u) ? nb - 1u - it / 2u : it / 2u;
+        const unsigned c0 = b * LLM_SMX_CB, nc = c0 + LLM_SMX_CB < GT ? LLM_SMX_CB : GT - c0;
+        unsigned       k, j, jend = 0u, jlo = ~0u;
+        for (k = 0u; k < nc; k++) {
+            const unsigned t = (c0 + k) % a->T, e = a->pos + t + 1u;
+            if (t < a->n) {
+                const unsigned lo = e > a->W ? e - a->W : 0u;
+                if (e > jend) jend = e;
+                if (lo < jlo) jlo = lo;
+            }
+        }
+        if (jlo > jend) jlo = jend;
+        {
+            const unsigned nr = jend - jlo;
+            int16_t tl[LLM_SMX_CB * (nr ? nr : 1u)];             /* the columns, transposed */
+            double  eb[nr ? nr : 1u];
+            for (j = 0u; j < nr; j++) {
+                const int16_t *row = (const int16_t *)a->s + (size_t)(jlo + j) * GT + c0;
+                for (k = 0u; k < nc; k++)
+                    tl[(size_t)k * nr + j] = row[k];
+            }
+            for (k = 0u; k < nc; k++) {
+                const unsigned c = c0 + k, t = c % a->T, hh = c / a->T;
+                Data_t        *pr = a->p + (size_t)c * keys;
+                const int16_t *r;
+                const double  *tab = _llm_sexp_tab[a->fs[hh] - LLM_SEXP_EMIN];
+                const double   ip = a->ip[hh];
+                unsigned       nk, j0;
+                int            m;
+                double         sum = 0.0, rinv;
+                if (t >= a->n) {
+                    memset(pr, 0, (size_t)keys * sizeof(Data_t));
+                    continue;
+                }
+                nk = a->pos + t + 1u;
+                j0 = nk > a->W ? nk - a->W : 0u;
+                r = tl + (size_t)k * nr;                        /* r[j - jlo]: key j */
+                m = r[j0 - jlo];
+                for (j = j0 + 1u; j < nk; j++)
+                    m = r[j - jlo] > m ? r[j - jlo] : m;
+                for (j = j0; j < nk; j++) {
+                    eb[j - jlo] = tab[m - r[j - jlo]];
+                    sum += eb[j - jlo];
+                }
+                rinv = ip / sum;
+                memset(pr, 0, (size_t)j0 * sizeof(Data_t));
+                for (j = j0; j < nk; j++) {
+                    const double q = eb[j - jlo] * rinv, f = q - floor(q);
+                    double       rq;
+                    if (f > 0.5 - 1e-7 && f < 0.5 + 1e-7) {
+                        pr[j] = llm_st(eb[j - jlo] / sum, ip);   /* near a tie: exact */
+                        continue;
+                    }
+                    rq = nearbyint(q);
+                    pr[j] = (Data_t)(int16_t)(rq > 32767.0 ? 32767.0 : rq);
+                }
+                memset(pr + nk, 0, (size_t)(keys - nk) * sizeof(Data_t));
+            }
+        }
+    }
+}
+
+static void llm_attn_softmax_w(llm_smxw_t *a)
+{
+    unsigned n = a->n;
+    if (n > a->T) n = a->T;
+    if (a->pos >= a->C) n = 0u;
+    else if (n > a->C - a->pos) n = a->C - a->pos;
+    a->n = n;
+    a->keys = llm_keys(a->pos, n, a->T, a->C, a->Q);
+    a->nblk = (a->G * a->T + LLM_SMX_CB - 1u) / LLM_SMX_CB;
+    host_parallel(llm_smxw_items, a, a->nblk, 1u, 1u);
+}
+"""
+
+
 def llm_c_helpers() -> str:
     return (LLM_C.replace("SILU_EMIN_VALUE", str(SILU_EMIN)).replace("SILU_NE_VALUE", str(SILU_NE))
             .replace("SEXP_EMIN_VALUE", str(SEXP_EMIN)).replace("SEXP_NE_VALUE", str(SEXP_NE)))
 
 
+def llm_ext_c_helpers() -> str:
+    """The host ops of the newer blocks' numerics (doc/plans/CHAT_PLAN.md §31), emitted
+    after llm_c_helpers() only where a node uses them (helpers "llm_ext")."""
+    return (LLM_EXT_C.replace("GELU_K_VALUE", repr(GELU_K)).replace("GELU_A_VALUE", repr(GELU_A)))
+
+
 __all__ = ("LLM_DOMAIN", "LLM_OP_FACTORIES", "LlmNode", "LlmEmbedNode", "LlmResAddNode",
-           "LlmRMSNormNode", "LlmSiluMulNode", "LlmAttentionNode", "LlmSelectRowNode",
+           "LlmRMSNormNode", "LlmSiluMulNode", "LlmGeluMulNode", "LlmAttentionNode", "LlmSelectRowNode",
            "LlmDequantNode", "LlmAttnPrepNode", "LlmKernelNode", "LlmAttnConvNode", "LlmAttnSoftmaxNode",
            "LlmAttnMergeNode", "RuntimeItem", "HostTable", "llm_c_helpers", "dot8", "rope",
-           "silu_table", "sexp_table", "attn_keys", "v_row_base", "KEY_QUANTUM",
+           "silu_table", "gelu_table", "sexp_table", "attn_keys", "v_row_base", "KEY_QUANTUM",
+           "llm_ext_c_helpers",
            "TABLE_FILE_BYTES",
            "LLM_C_DMA")

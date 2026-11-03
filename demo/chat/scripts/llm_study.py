@@ -106,7 +106,7 @@ another Llama checkpoint (e.g. assets/smollm2-360m-instruct).  Results:
 others (study_dir).
 Deterministic: greedy decoding only, no sampling, fixed data.
 """
-import argparse, collections, json, math, os, sys, time
+import argparse, collections, json, math, os, re, sys, time
 import numpy as np
 
 _SRC = {}
@@ -195,6 +195,12 @@ PROMPTS = [
                      "like some suggestions?"},
                     {"role": "user", "content": "I know where I'm going. What should I pack?"}]),
 ]
+# A gate prompt beyond a sliding window (Gemma 3's 512): its prefill and decode steps
+# attend through the cut (llm_project.gate_prompts of a model with a window)
+WINDOW_PROMPTS = [
+    ("long-summary", [{"role": "user", "content": "Summarize the following text in two sentences.\n\n"
+                       + "\n\n".join([PARAGRAPH] * 5)}]),
+]
 CALIB_PROMPTS = [
     [{"role": "user", "content": "Name three primary colors."}],
     [{"role": "user", "content": "Write a haiku about winter."}],
@@ -252,6 +258,7 @@ class Profile(llm_model.Profile):
     def __init__(self, assets):
         super().__init__(assets)
         self.prompts = PROMPTS if self.chat else STORY_PROMPTS
+        self.gate_extra = WINDOW_PROMPTS if self.chat else []     # gate-only prompts (not studied)
         self.texts = (("heldout_wikitext2_test.txt", "calib_wikitext2_valid.txt") if self.chat
                       else tuple(n for n, _, _ in STORY_TEXTS))
 
@@ -372,14 +379,26 @@ class Cfg:
         self.rot, self.rope_scaling, self.window = a.rot, a.rope_scaling, a.window
         self.emb_mult, self.res_mult, self.attn_mult, self.logit_div = (a.emb_mult, a.res_mult,
                                                                           a.attn_mult, a.logit_div)
+        # new numerics (CHAT_PLAN §31): the gate activation, (1 + w) norms (folded by llm_weights),
+        # q / k head norms, norms of the attention / MLP outputs, per-layer windows and RoPE
+        self.act, self.norm_offset, self.qk_norm, self.post_norms = (a.act, a.norm_offset, a.qk_norm,
+                                                                     a.post_norms)
+        self.layer_types, self.local_theta = a.layer_types, a.local_theta
+        self.layer_window = a.layer_window
 
 
-def rope_tables(cfg, n):
+def rope_tables(cfg, n, layer=None):
     """float32 cos / sin [n, HD] (the host RoPE tables; HF's float32 math up to 1 ulp):
-    src/rope.py's half tables (scaling, partial rotation) for both halves."""
+    src/rope.py's half tables (scaling, partial rotation) for both halves; ``layer``:
+    that layer's (a sliding layer's own theta, Gemma 3)."""
     lw = weights()
-    c, s = lw.rope.half_tables(lw.rope_spec(cfg), n)
+    c, s = lw.rope.half_tables(lw.rope_spec(cfg, layer), n)
     return (np.concatenate([c, c], 1).astype(np.float64), np.concatenate([s, s], 1).astype(np.float64))
+
+
+def rope_sets(cfg, n):
+    """{"global": (cos, sin)[, "local": ...]}: every table set the model's layers use."""
+    return {k: rope_tables(cfg, n, li) for k, li in weights().rope_kinds(cfg).items()}
 
 
 # ------------------------------------------------------------------ numerics
@@ -417,6 +436,32 @@ def silu_table(f_g, off=0.0):
             t[i] = g / (1.0 + math.exp(-g)) if g > -700 else 0.0
         _silu_tab[(f_g, off)] = t
     return _silu_tab[(f_g, off)]
+
+
+# GELU, tanh approximation (Hugging Face's gelu_pytorch_tanh, Gemma's MLP):
+# 0.5 g (1 + tanh(sqrt(2/pi) (g + 0.044715 g^3))) = g / (1 + exp(z)),
+# z = GELU_K (g + GELU_A g^3), GELU_K = -2 sqrt(2/pi) — libm exp only (as SiLU)
+GELU_K, GELU_A = -1.5957691216057308, 0.044715
+_gelu_tab = {}
+
+
+def gelu_tanh(g):
+    """float GELU tanh of an array (the float reference)."""
+    with np.errstate(over="ignore"):
+        return g / (1.0 + np.exp(GELU_K * (g + GELU_A * g * g * g)))
+
+
+def gelu_table(f_g, off=0.0):
+    """gelu_tanh(g) for every raw int16 r, g = (r + off) * 2^-f_g: g / (1 + exp(z)),
+    z = GELU_K * (g + GELU_A * g * g * g) in that order (0 for z >= 700), libm exp."""
+    if (f_g, off) not in _gelu_tab:
+        t = np.empty(65536)
+        for i in range(65536):
+            g = (i - 32768 + off) / 2.0 ** f_g
+            z = GELU_K * (g + GELU_A * g * g * g)
+            t[i] = g / (1.0 + math.exp(z)) if z < 700.0 else 0.0
+        _gelu_tab[(f_g, off)] = t
+    return _gelu_tab[(f_g, off)]
 
 
 class Stats:
@@ -515,6 +560,9 @@ class Model:
         if self.bf:
             self.q = False
         self.fmt = fmt or {}
+        if self.pol.get("res_bits") and ("res", cfg.L) in self.fmt:
+            # the calibrated int32 residual's exponent (make_formats: a residual beyond 2^16)
+            self.pol = dict(self.pol, res_bits=int(self.fmt[("res", cfg.L)]))
         self.sink = self.pol.get("sink", False) if sink is None else sink
         self.sink_model = sink_model
         self._sink = {}
@@ -522,10 +570,22 @@ class Model:
         W = weights().prepare(cfg, W)       # the plain block's tensors, as the frontend reads them
         L, H, KV = cfg.L, cfg.H, cfg.KV
         self.grp = np.arange(H) // (H // KV)
-        self.cos, self.sin = cos_sin if cos_sin is not None else rope_tables(cfg, 2 * CTX)
-        self.gin = [W[f"model.layers.{l}.input_layernorm.weight"].astype(np.float64) for l in range(L)]
-        self.gpost = [W[f"model.layers.{l}.post_attention_layernorm.weight"].astype(np.float64) for l in range(L)]
-        self.gfin = W["model.norm.weight"].astype(np.float64)
+        # the RoPE tables per kind (weights().rope_kinds: "global", a sliding layers' "local")
+        cs = cos_sin if isinstance(cos_sin, dict) else ({"global": cos_sin} if cos_sin is not None else {})
+        self.cs = {k: cs[k] if k in cs else rope_tables(cfg, 2 * CTX, li)
+                   for k, li in weights().rope_kinds(cfg).items()}
+        self.cos, self.sin = self.cs["global"]
+        g64 = lambda n: W[n].astype(np.float64)
+        self.gin = [g64(f"model.layers.{l}.input_layernorm.weight") for l in range(L)]
+        self.gpost = [g64(f"model.layers.{l}.post_attention_layernorm.weight") for l in range(L)]
+        self.gfin = g64("model.norm.weight")
+        # q / k head norms [HD] (cfg.qk_norm), attention / MLP output norms [D] (cfg.post_norms)
+        self.gqn = [g64(f"model.layers.{l}.self_attn.q_norm.weight") for l in range(L)] if cfg.qk_norm else None
+        self.gkn = [g64(f"model.layers.{l}.self_attn.k_norm.weight") for l in range(L)] if cfg.qk_norm else None
+        self.gao = [g64(f"model.layers.{l}.attn_out_norm.weight") for l in range(L)] if cfg.post_norms else None
+        self.gmo = [g64(f"model.layers.{l}.mlp_out_norm.weight") for l in range(L)] if cfg.post_norms else None
+        # the embedding multiplier: a float32 product at the lookup (Granite, Gemma's sqrt(hidden))
+        self.emb_scale = float(getattr(cfg, "emb_mult", 1.0))
         E = W["model.embed_tokens.weight"]
         lm = lm_weight(W, cfg)
         self.stats = Stats(L)
@@ -658,6 +718,40 @@ class Model:
         r = 1.0 / np.sqrt(ss / h.shape[1] + self.cfg.eps)
         return self.host((h * r[:, None]) * gamma, cls, l, self.E(cls, l))
 
+    def rms_in(self, x, gamma, cin, cls, l, nh=None):
+        """An RMSNorm of a kernel output x [T, C] (cfg.post_norms: o, d; cfg.qk_norm: q0 /
+        k0 over each of nh heads, gamma [HD]) -> cls at its per-channel exponents (tiled over
+        the heads).  The row-ops unit's integer norm (policy inorm): x widened exactly to
+        int32 at the finest of cin's exponents (an ADDX onto zero), then NORM of the int32
+        rows (rowops_spec.rms_norm)."""
+        T, C = x.shape
+        n = C // nh if nh else C
+        rows = x.reshape(-1, n)
+        if self.q and self.pol.get("inorm") and not self.exact(cls):
+            fi = self.Eh(cin, l, C)
+            fc = int(fi.max())
+            assert fc - int(fi.min()) <= WIDEN_BITS, (cin, l, fi.min(), fc)
+            e = self.Eh(cls, l, C)
+            assert (e.reshape(-1, n) == e[:n]).all(), (cls, l)    # one exponent per head channel
+            y = rowops().rms_norm(np.rint(rows * p2(fc)).astype(np.int64), fc, gamma, self.cfg.eps,
+                                  e[:n]).reshape(T, C)
+            self.stats.add(cls, l, float(np.abs(y / p2(e)).max()) if y.size else 0.0,
+                           int(((y == I16_LO) | (y == I16_HI)).sum()), y.size)
+            return y / p2(e)[None, :]
+        ss = np.cumsum(rows * rows, axis=-1)[:, -1]
+        r = 1.0 / np.sqrt(ss / n + self.cfg.eps)
+        return self.host(((rows * r[:, None]) * gamma).reshape(T, C), cls, l, self.E(cls, l))
+
+    def window(self, l):
+        """Layer l's sliding window (None: full attention)."""
+        lw = getattr(self.cfg, "layer_window", None)
+        return lw(l) if lw is not None else None
+
+    def rope_cs(self, l):
+        """Layer l's RoPE tables (cos, sin) [positions, HD]."""
+        cs = getattr(self, "cs", None)
+        return (self.cos, self.sin) if cs is None else cs[weights().rope_kind(self.cfg, l)]
+
     @property
     def xattn(self):
         """xattn applies to this forward call (policy xattn, or the mixed policy's
@@ -666,7 +760,8 @@ class Model:
 
     def rope(self, x, pos, cls, l):                      # x [T, nh, HD]
         T, nh, HD = x.shape
-        c, s = self.cos[pos][:, None, :], self.sin[pos][:, None, :]
+        cos, sin = self.rope_cs(l)
+        c, s = cos[pos][:, None, :], sin[pos][:, None, :]
         half = HD // 2
         rot = np.concatenate([-x[..., half:], x[..., :half]], axis=-1)
         e = self.E(cls, l)
@@ -674,11 +769,16 @@ class Model:
         if (self.q and ir and (ir is True or ir == self.phase) and not self.exact(cls)
                 and not ((self.hattn or self.xattn) and cls == "q")):
             # the row-ops unit's integer RoPE (rowops_spec.rope): x on the kernel output's
-            # grid (q0 / k0 exponents per head), int24 cos / sin, one rounding at e
-            fx = self.Eh(cls + "0", l, nh * HD).reshape(nh, HD)        # per channel (pow2 formats)
+            # grid (q0 / k0 exponents per head; with head norms qn / kn), int24 cos / sin,
+            # one rounding at e
+            src = cls + ("n" if getattr(self.cfg, "qk_norm", False) else "0")
+            fx = self.Eh(src, l, nh * HD).reshape(nh, HD)              # per channel (pow2 formats)
             if not hasattr(self, "_rope_raw"):
-                self._rope_raw = rowops().rope_tables_raw(self.cos, self.sin)
-            cr, sr = self._rope_raw
+                self._rope_raw = {}
+            kind = id(cos)
+            if kind not in self._rope_raw:
+                self._rope_raw[kind] = rowops().rope_tables_raw(cos, sin)
+            cr, sr = self._rope_raw[kind]
             yr = rowops().rope(np.rint(x * p2(fx)[None]).astype(np.int64), fx,
                                cr[pos], sr[pos], self.Eh(cls, l, nh))
             ev = self.Eh(cls, l, nh)
@@ -707,6 +807,8 @@ class Model:
             return self.res32(h + d, l)
         y = (h + d).astype(np.float32).astype(np.float64)  # float32 host residual
         self.stats.add("h", l, float(np.abs(y).max()), int((np.abs(y) * 256 > 32767.5).sum()), y.size)
+        if self.record_ch and not self.q and y.size:     # the residual's range (make_formats: "res")
+            self.stats.add_ch("h", 0, np.abs(y).max(0))
         return y
 
     def res32(self, y, l):
@@ -720,15 +822,20 @@ class Model:
         self.stats.add("h", l, float(np.abs(y).max()), sat, y.size)
         return raw / p2(fr)
 
-    def softmax(self, s, mask, fs, fp, l):              # one head: s [T, S], mask [T, S]
+    def softmax(self, s, mask, fs, fp, l, unit=True):   # one head: s [T, S], mask [T, S]
+        """unit False: a sliding layer's — its mask is no valid-length prefix, so the
+        host's softmax even where the policy puts the others on VectorOPKernel's unit."""
         vs = self.pol.get("vsmx")
-        if self.q and not self.exact("s") and (vs is True or vs == self.phase):
+        if self.q and not self.exact("s") and (vs is True or vs == self.phase) and unit:
             # VectorOPKernel's softmax (doc/plans/SOFTMAX_PLAN.md §2.1): the
             # integer specification of inference-scheduler/src/vectorop_smx.py
             raw = np.rint(s * p2(fs)).astype(np.int64)
             cm, cs = vsmx().scale_regs(int(fs), 1.0 / math.sqrt(self.cfg.HD))
             P = vsmx().softmax_raw(raw, mask.sum(-1), cm, cs, int(fp))
             return P * p2(-int(fp))
+        return self._softmax_host(s, mask, fs, fp, l)
+
+    def _softmax_host(self, s, mask, fs, fp, l):
         if not self.q or self.exact("s"):
             x = np.where(mask, s * (1.0 / math.sqrt(self.cfg.HD)), -np.inf)
             e = np.exp(x - x.max(-1, keepdims=True))
@@ -740,6 +847,8 @@ class Model:
         return self.host(e / np.cumsum(e, -1)[..., -1:], "p", l, fp, record=False)
 
     def silu_mul(self, g, u, l):
+        if getattr(self.cfg, "act", "silu") == "gelu_tanh":
+            return self.gelu_mul(g, u, l)
         if not self.q or self.exact("g"):
             return self.host(g / (1.0 + np.exp(-g)) * u, "a", l, self.E("a", l))
         fg = self.E("g", l)
@@ -762,11 +871,30 @@ class Model:
             sil[:, cols] = silu_table(int(f), 0.5 if self.floor_fix else 0.0)[idx]
         return self.host(sil * u, "a", l, self.E("a", l))
 
+    def gelu_mul(self, g, u, l):
+        """a = gelu_tanh(g) * u (cfg.act gelu_tanh): a table over g's raw int16 per gate
+        exponent (gelu_table), written at f_a — the host op LlmGeluMul."""
+        if not self.q or self.exact("g"):
+            return self.host(gelu_tanh(g) * u, "a", l, self.E("a", l))
+        fg = self.E("g", l)
+        fgv = np.full(g.shape[1], fg, np.int64) if np.ndim(fg) == 0 else np.asarray(fg)
+        gl = np.empty_like(g)
+        for f in np.unique(fgv):
+            cols = fgv == f
+            idx = np.floor(g[:, cols] * p2(f)).astype(np.int64) + 32768     # the raw int16
+            gl[:, cols] = gelu_table(int(f), 0.5 if self.floor_fix else 0.0)[idx]
+        return self.host(gl * u, "a", l, self.E("a", l))
+
     def attn(self, q, K, V, n0, l):
-        """q [T, H, HD] (this sequence's new rows), K / V [KV, S, HD] incl. the new rows."""
+        """q [T, H, HD] (this sequence's new rows), K / V [KV, S, HD] incl. the new rows;
+        a sliding layer's query at position t sees the keys t - W < j <= t."""
         cfg = self.cfg
         T, S, HD = q.shape[0], K.shape[1], cfg.HD
-        mask = np.arange(S)[None, :] <= (n0 + np.arange(T))[:, None]
+        tq = n0 + np.arange(T)
+        mask = np.arange(S)[None, :] <= tq[:, None]
+        w = self.window(l)
+        if w is not None:
+            mask &= np.arange(S)[None, :] > (tq - w)[:, None]
         out = np.empty((T, cfg.H, HD))
         if self.q and self.xattn:
             # host region with a fixed operation order (the phase-3 C code):
@@ -776,10 +904,11 @@ class Model:
                 g = self.grp[h]
                 for t in range(T):
                     n = n0 + t + 1                          # keys 0 .. pos(t)
-                    s = dot8(q[t, h][None, :] * K[g, :n]) * scale
+                    j0 = max(0, n - w) if w is not None else 0
+                    s = dot8(q[t, h][None, :] * K[g, j0:n]) * scale
                     e = libm_exp(s - s.max())
                     p = e / np.cumsum(e)[-1]
-                    out[t, h] = np.cumsum(p[:, None] * V[g, :n], axis=0)[-1]
+                    out[t, h] = np.cumsum(p[:, None] * V[g, j0:n], axis=0)[-1]
             return self.host(out.reshape(T, -1), "pv", l, self.E("pv", l)).reshape(T, cfg.H, HD)
         if self.q and self.hattn:
             # host region: s = q.k (exact in double), softmax in double, P.V in double,
@@ -805,17 +934,24 @@ class Model:
                 continue
             fvg = fv[g * HD:(g + 1) * HD]
             s = self.kmm(q[:, h] * p2(fq[h]), (K[g] * p2(fk[g])).T, fs[h], shs[h], "s", l)
-            p = self.softmax(s, mask, fs[h], fp[h], l)
+            p = self.softmax(s, mask, fs[h], fp[h], l, unit=w is None)
             out[:, h] = self.kmm(p * p2(fp[h]), V[g] * p2(fvg)[None, :], fpv[h * HD:(h + 1) * HD], shp[h], "pv", l)
         return out
 
     def embed(self, ids):
         """The residual stream's first rows: embedding-table rows (vlm_study.py
         replaces the image tokens' rows with image features)."""
-        h = self.emb[ids].astype(np.float64)
+        h = self.emb_rows(ids)
         if self.q and self.pol.get("res_bits"):           # the stream starts on the int32 grid
             h = self.res32(h, 0)
         return h
+
+    def emb_rows(self, ids):
+        """Embedding-table rows times the embedding multiplier, a float32 product (LlmEmbed's
+        scale)."""
+        if getattr(self, "emb_scale", 1.0) == 1.0:
+            return self.emb[ids].astype(np.float64)
+        return (self.emb[ids].astype(np.float32) * np.float32(self.emb_scale)).astype(np.float64)
 
     # ---- position 0 (attention sink) precomputed in float
     def _write_sink(self, s, tok):
@@ -877,8 +1013,12 @@ class Model:
             self.stats.add("h", 0, float(np.abs(h).max()), 0, h.size)
         for l in range(L):
             x = self.rms(h, self.gin[l], "x", l)
-            q = self.rope(self.lin(x, l, "q").reshape(T, H, HD), pos, "q", l)
-            k = self.rope(self.lin(x, l, "k").reshape(T, KV, HD), pos, "k", l)
+            q, k = self.lin(x, l, "q"), self.lin(x, l, "k")
+            if cfg.qk_norm:                                 # RMSNorm of every head before RoPE
+                q = self.rms_in(q, self.gqn[l], "q0", "qn", l, H)
+                k = self.rms_in(k, self.gkn[l], "k0", "kn", l, KV)
+            q = self.rope(q.reshape(T, H, HD), pos, "q", l)
+            k = self.rope(k.reshape(T, KV, HD), pos, "k", l)
             v = self.lin(x, l, "v")
             if self.q and ("vc", l) in self.fmt:            # host writes the V cache at its own exponent
                 v = self.host(v, "vc", l, self.E("vc", l))
@@ -890,10 +1030,15 @@ class Model:
                 s.v[l][:, s.n:s.n + b - a] = v[a:b].transpose(1, 0, 2)
                 n1 = s.n + b - a
                 att[a:b] = self.attn(q[a:b], s.k[l][:, :n1], s.v[l][:, :n1], s.n, l)
-            h = self.resadd(h, self.lin(att.reshape(T, H * HD), l, "o"), l)
+            o = self.lin(att.reshape(T, H * HD), l, "o")
+            if cfg.post_norms:                              # the attention output's norm, then the add
+                o = self.rms_in(o, self.gao[l], "o", "on", l)
+            h = self.resadd(h, o, l)
             x2 = self.rms(h, self.gpost[l], "x2", l)
-            a_ = self.silu_mul(self.lin(x2, l, "g"), self.lin(x2, l, "u"), l)
-            h = self.resadd(h, self.lin(a_, l, "d"), l)
+            d = self.lin(self.silu_mul(self.lin(x2, l, "g"), self.lin(x2, l, "u"), l), l, "d")
+            if cfg.post_norms:
+                d = self.rms_in(d, self.gmo[l], "d", "dn", l)
+            h = self.resadd(h, d, l)
         for s, t in zip(seqs, toks):
             s.n += len(t)
         if want == "last":
@@ -1020,13 +1165,67 @@ POLICIES = {
                                             inorm=True, isilu=True, irope=True),
     "pow2+sink+p12+vsmx+rowops+drope": dict(_RF, sink=True, fmt="pow2", p_bits=12, vsmx="prefill",
                                             res_bits=15, inorm=True, isilu=True, irope=True),
+    # the row ops on the unit with the attention prep (RoPE, the caches, the q image) on the host:
+    # heads beyond the unit's ROPE segment (128; Gemma 3's 256), src/llama.py uprep False
+    "pow2+sink+p12+rowops+hprep":      dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=15,
+                                            inorm=True, isilu=True),
+    "pow2+sink+p12+vsmx+rowops+hprep": dict(_RF, sink=True, fmt="pow2", p_bits=12, vsmx="prefill",
+                                            res_bits=15, inorm=True, isilu=True),
 }
+# Modifiers after a POLICIES name (policy_spec; CHAT_PLAN §31): the formats' (x / x2 / a / xf
+# / q / k / vc + N: that class's exponent cap instead of in_cap, mN: margin N, pN: softmax P
+# at 2^-N) and the
+# execution's (vsmx, rowops, drope, hprep: as the named policies above), e.g.
+# "pow2+sink+p12+xf5+vc6+vsmx+rowops+hprep".
+_CAP = re.compile(r"(x|x2|a|xf|q|k|vc)(\d+)$")
+_MODS = {"vsmx": dict(vsmx="prefill"),
+         "rowops": dict(res_bits=15, inorm=True, isilu=True, irope="prefill"),
+         "drope": dict(irope=True),
+         "hprep": dict(irope=None)}
+
+
+def policy_spec(name):
+    """The policy dict of ``name``: a POLICIES entry, or the longest POLICIES prefix
+    followed by modifiers (_CAP, mN, _MODS)."""
+    if name in POLICIES:
+        return POLICIES[name]
+    parts = name.split("+")
+    for k in range(len(parts) - 1, 0, -1):
+        base = "+".join(parts[:k])
+        if base in POLICIES and POLICIES[base] is not None:
+            break
+    else:
+        raise KeyError(f"policy {name!r}: no known base (POLICIES)")
+    pol = dict(POLICIES[base])
+    for mod in parts[k:]:
+        cm = _CAP.match(mod)
+        if cm:
+            pol["in_caps"] = dict(pol.get("in_caps") or {}, **{cm.group(1): int(cm.group(2))})
+        elif re.fullmatch(r"m\d+", mod):
+            pol["margin"] = float(mod[1:])
+        elif re.fullmatch(r"p\d+", mod):
+            pol["p_bits"] = int(mod[1:])
+        elif mod in _MODS:
+            pol.update(_MODS[mod])
+            if pol.get("irope") is None:
+                pol.pop("irope", None)
+        else:
+            raise KeyError(f"policy {name!r}: unknown modifier {mod!r}")
+    if pol.get("irope") and not pol.get("res_bits"):
+        raise KeyError(f"policy {name!r}: drope needs rowops")
+    return pol
+
+
 DEFAULT_POLICIES = ("bf16,q88,res_float,res_float+sink,fit+sink,pow2+sink,pow2+sink+p12,pow2+sink+hattn,"
                     "pow2+p12,pow2_tensor+sink+p12,pow2+sink+p12+emb_q88,pow2+sink+p12+fw")
 MARGIN = 2.0          # calibrated formats keep one bit of headroom over the calibration max
 
 
 def fbits(mx, margin=MARGIN, lo=-8, hi=15):
+    return _fbits(mx, margin, lo, hi)
+
+
+def _fbits(mx, margin=MARGIN, lo=-8, hi=15):
     """largest f with mx * margin * 2^f <= 32767 (int16 raw), elementwise."""
     mx = np.asarray(mx, np.float64)
     with np.errstate(divide="ignore"):
@@ -1046,6 +1245,8 @@ def make_formats(pol, ch, W, cfg):
         return {}
     W = weights().prepare(cfg, W)
     kind, per_tensor = pol["fmt"], pol.get("per_tensor", False)
+    margin = float(pol.get("margin", MARGIN))   # headroom over the calibration maxima
+    fbits = lambda mx: _fbits(mx, margin)
     L, H, KV, HD = cfg.L, cfg.H, cfg.KV, cfg.HD
     grp = np.arange(H) // (H // KV)
     fmt = {}
@@ -1066,19 +1267,30 @@ def make_formats(pol, ch, W, cfg):
 
     out_cap = 8 if kind == "fit" else None      # kernel outputs: fit caps at Q8.8, pow2 uses the range
     in_cap = pol.get("in_cap", 8)               # host-written kernel inputs (x, x2, a, xf, q, k, V cache)
+    caps = dict(pol.get("in_caps") or {})       # per class (x, x2, a, xf, q, k, vc): instead of in_cap
+    cap = lambda cls: caps.get(cls, in_cap)
     for l in list(range(L)) + [L]:
         if l == L:
-            fmt[("xf", L)] = rng("xf", L, in_cap)
+            fmt[("xf", L)] = rng("xf", L, cap("xf"))
             fmt[("logits", L)] = rng("logits", L, out_cap)
             continue
         for cls in ("x", "x2", "a"):
-            fmt[(cls, l)] = rng(cls, l, in_cap)
+            fmt[(cls, l)] = rng(cls, l, cap(cls))
         for cls in ("q0", "k0", "v", "o", "g", "u", "d"):
             fmt[(cls, l)] = rng(cls, l, out_cap)
-        fq, fk = heads("q", l, H, in_cap), heads("k", l, KV, in_cap)
+        if getattr(cfg, "act", "silu") == "silu":       # the unit's SiLU * up takes gates <= 2^-G_BITS
+            fmt[("g", l)] = np.minimum(fmt[("g", l)], rowops().G_BITS)
+        if cfg.qk_norm:                 # the head norms' outputs (RoPE's input): per head channel
+            for cls, nh in (("qn", H), ("kn", KV)):
+                m = ch[(cls, l)].reshape(nh, HD).max(0)
+                fmt[(cls, l)] = np.tile(fbits(np.full_like(m, m.max()) if per_tensor else m), nh)
+        if cfg.post_norms:              # the attention / MLP output norms (the residual's deltas)
+            for cls in ("on", "dn"):
+                fmt[(cls, l)] = rng(cls, l, None)
+        fq, fk = heads("q", l, H, cap("q")), heads("k", l, KV, cap("k"))
         if pol.get("hattn"):
             fmt[("q", l)], fmt[("k", l)] = fq, fk
-            fmt[("pv", l)] = rng("pv", l, in_cap)
+            fmt[("pv", l)] = rng("pv", l, cap("pv"))
             continue
         # scores q.k must fit int16 at f_q + f_k - 8: lower f_q (per head)
         smax = ch[("s", l)] if not per_tensor else np.full(H, ch[("s", l)].max())
@@ -1090,7 +1302,7 @@ def make_formats(pol, ch, W, cfg):
             # P at p_bits; the host re-rounds the V cache so that P.V (f_p + f_vc - 8) still fits
             fp = np.full(H, pol["p_bits"])
             lim = (fpv_max + 8 - fp[:, None]).reshape(KV, H // KV, HD).min(1).reshape(-1)
-            fmt[("vc", l)] = np.minimum(np.minimum(fbits(ch[("v", l)]), in_cap), lim)
+            fmt[("vc", l)] = np.minimum(np.minimum(fbits(ch[("v", l)]), cap("vc")), lim)
         else:
             fp = np.minimum(15 if kind == "pow2" else 8, (fpv_max - fv.reshape(KV, HD)[grp] + 8).min(1))
         fmt[("q", l)], fmt[("k", l)], fmt[("p", l)] = fq, fk, fp
@@ -1109,7 +1321,33 @@ def make_formats(pol, ch, W, cfg):
                 lim = np.floor(np.log2(32767.0 / np.maximum(np.abs(Wt), 1e-30)))
             fo_max = (lim + fa[:, None] - 8).min(0).astype(np.int64)
             fmt[(co, l)] = np.minimum(np.broadcast_to(np.asarray(fmt[(co, l)]), fo_max.shape), fo_max)
+    # the int32 residual (the row-ops unit) at 2^-15 unless the calibrated residual needs a coarser
+    # exponent (Gemma's reaches 1e5: "res"); the deltas it adds exactly then take none finer
+    if ("h", 0) in ch:
+        hmax = float(np.max(ch[("h", 0)])) * margin
+        res = int(np.floor(np.log2(2147483647.0 / max(hmax, 1e-30))))
+        if res < RES_BITS:
+            fmt[("res", L)] = res
+            for l in range(L):
+                for cls in (("on", "dn") if cfg.post_norms else ("o", "d")):
+                    fmt[(cls, l)] = np.minimum(np.asarray(fmt[(cls, l)], np.int64), res)
+    # a kernel output an RMSNorm reads is widened to int32 at its finest exponent (the unit's
+    # integer norm sums the squares of raw values on one grid): at most WIDEN_BITS finer than
+    # its coarsest (lowering an exponent keeps the range and the weights' fit)
+    for l in range(L):
+        for cls in NORMED_INPUTS(cfg):
+            f = np.asarray(fmt[(cls, l)], np.int64)
+            fmt[(cls, l)] = np.minimum(f, int(f.min()) + WIDEN_BITS)
     return {k: (_vec_or_scalar(v) if k[0] != "sh" else v) for k, v in fmt.items()}
+
+
+WIDEN_BITS = 16       # int16 widened to int32 by a left shift of at most 16 (32767 << 16 < 2^31)
+RES_BITS = 15         # the int32 residual's exponent (src/graph_builder.py RES_BITS) unless "res"
+
+
+def NORMED_INPUTS(cfg):
+    """The kernel outputs an RMSNorm reads: q0 / k0 (head norms), o / d (output norms)."""
+    return (("q0", "k0") if cfg.qk_norm else ()) + (("o", "d") if cfg.post_norms else ())
 
 
 # ------------------------------------------------------------------ study
@@ -1212,10 +1450,12 @@ def run_policy(name, model, prompts, held, ref, max_new, log, do_greedy=True, *,
 
 CLASS_DOC = [
     ("h", "residual stream (after each add)"), ("x", "RMSNorm (input) out"), ("q0", "q = x.Wq"),
-    ("k0", "k = x.Wk"), ("v", "v = x.Wv (V cache)"), ("q", "RoPE(q)"), ("k", "RoPE(k) (K cache)"),
+    ("k0", "k = x.Wk"), ("qn", "RMSNorm(q) per head"), ("kn", "RMSNorm(k) per head"),
+    ("v", "v = x.Wv (V cache)"), ("q", "RoPE(q)"), ("k", "RoPE(k) (K cache)"),
     ("s", "scores q.k (raw, before 1/8)"), ("p", "softmax P"), ("pv", "P.V"), ("o", "o_proj out"),
-    ("x2", "RMSNorm (post-attn) out"), ("g", "gate = x2.Wg"), ("u", "up = x2.Wu"),
-    ("a", "silu(gate)*up"), ("d", "down_proj out"), ("xf", "final RMSNorm out"), ("logits", "LM head")]
+    ("on", "RMSNorm(o) (post-attn)"), ("x2", "RMSNorm (pre-MLP) out"), ("g", "gate = x2.Wg"),
+    ("u", "up = x2.Wu"), ("a", "act(gate)*up"), ("d", "down_proj out"), ("dn", "RMSNorm(d) (post-MLP)"),
+    ("xf", "final RMSNorm out"), ("logits", "LM head")]
 
 
 def cmd_study(args):
@@ -1234,7 +1474,7 @@ def cmd_study(args):
     prompts, held, calib = build_data(assets, tok, args.quick, prof)
     held = held[:args.windows or prof.windows]
     max_new = 32 if args.quick else args.max_new
-    cs = rope_tables(cfg, 2 * CTX)
+    cs = rope_sets(cfg, 2 * CTX)
     log(f"study {time.strftime('%Y-%m-%d %H:%M:%S')}  {prof.kind} profile, context {prof.ctx}, prompts {len(prompts)} "
         f"(tokens {[len(p) for _, p in prompts]}), held-out {len(held)} x {len(held[0])}, max_new {max_new}")
     pols = args.policies.split(",")
@@ -1255,7 +1495,7 @@ def cmd_study(args):
     for name in pols:
         if name == "float":
             continue
-        pol = POLICIES[name]
+        pol = policy_spec(name)
         fmt = make_formats(pol, cal[bool(pol.get("sink"))], W, cfg)
         m = Model(W, cfg, pol, fmt, cos_sin=cs, sink_model=fm0)
         r = run_policy(name, m, prompts, held, ref, max_new, log, do_greedy=not args.nogreedy,
@@ -1340,8 +1580,8 @@ def report(results, prompts, tok, ref_stats, out_dir, log):
     log(f"\nside-by-side generations: {os.path.join(out_dir, 'generations.txt')}")
 
 
-ABLATE_GROUPS = [("x",), ("q0", "k0"), ("q", "k"), ("s",), ("p",), ("v",), ("pv",), ("o",), ("x2",),
-                 ("g", "u"), ("a",), ("d",), ("xf",), ("logits",)]
+ABLATE_GROUPS = [("x",), ("q0", "k0"), ("qn", "kn"), ("q", "k"), ("s",), ("p",), ("v",), ("pv",), ("o",),
+                 ("on",), ("x2",), ("g", "u"), ("a",), ("d",), ("dn",), ("xf",), ("logits",)]
 
 
 def cmd_ablate(args):
@@ -1357,12 +1597,12 @@ def cmd_ablate(args):
     prof = Profile(assets)
     prompts, held, calib = build_data(assets, tok, args.quick, prof)
     held = held[:1]
-    cs = rope_tables(cfg, 2 * CTX)
+    cs = rope_sets(cfg, 2 * CTX)
     say = lambda m: print(m, flush=True)
     fm = Model(W, cfg, None, cos_sin=cs)
     fm0 = Model(W, cfg, None, cos_sin=cs, base=fm)
     ref = run_policy("float", fm, prompts, held, None, args.max_new, lambda m: None, eog=prof.eog)
-    base = dict(POLICIES[args.base])
+    base = dict(policy_spec(args.base))
     cm = Model(W, cfg, None, cos_sin=cs, base=fm, sink=bool(base.get("sink")), sink_model=fm0, record_ch=True)
     for c in calib:
         teacher_forced(cm, c)
@@ -1391,13 +1631,13 @@ def cmd_formats(args):
     cfg, W = load_all(args.assets)
     tok = Tok(args.assets)
     _, _, calib = build_data(args.assets, tok, False)
-    pol = POLICIES[args.base]
+    pol = policy_spec(args.base)
     fm = Model(W, cfg, None)
     cm = Model(W, cfg, None, base=fm, sink=bool(pol.get("sink")), sink_model=fm, record_ch=True)
     for c in calib:
         teacher_forced(cm, c)
     fmt = make_formats(pol, cm.stats.ch, W, cfg)
-    out = {"policy": args.base, "spec": POLICIES[args.base], "margin": MARGIN,
+    out = {"policy": args.base, "spec": pol, "margin": float(pol.get("margin", MARGIN)),
            "exponents": {f"{k[0]}@{k[1]}": np.asarray(v).tolist() for k, v in fmt.items()}}
     if pol.get("sink"):
         m = Model(W, cfg, pol, fmt, sink_model=fm)
@@ -1501,6 +1741,21 @@ ARCH_CASES = {
         "pad_token_id": 0, "partial_rotary_factor": 0.75, "original_max_position_embeddings": 512,
         "rope_scaling": {"type": "longrope", "short_factor": [1.0, 1.1, 1.3, 1.6, 2.0, 2.5],
                          "long_factor": [2.0] * 6}}),
+    # new numerics (CHAT_PLAN §31): (1 + w) norms, sqrt(hidden) embedding, q / k head norms,
+    # output norms, GELU tanh, a window of 8 on the sliding layers (the 96-token sequence cuts it)
+    "gemma3":           ("Gemma3TextConfig", {"head_dim": 16, "query_pre_attn_scalar": 16,
+                                              "sliding_window": 8, "layer_types": ["sliding_attention",
+                                                                                   "full_attention"],
+                                              "rope_local_base_freq": 100.0, "pad_token_id": 0}),
+    "gemma3-qpas":      ("Gemma3TextConfig", {"head_dim": 16, "query_pre_attn_scalar": 24,
+                                              "sliding_window": 1024, "rope_parameters": {
+                                                  "full_attention": {"rope_type": "linear", "factor": 2.0,
+                                                                     "rope_theta": 50000.0},
+                                                  "sliding_attention": {"rope_type": "default",
+                                                                        "rope_theta": 300.0}},
+                                              "layer_types": ["full_attention", "sliding_attention"],
+                                              "pad_token_id": 0}),
+    "qwen3":            ("Qwen3Config", {"head_dim": 16}),
 }
 
 
@@ -1554,7 +1809,7 @@ def cmd_validate_arch(args):
 def cmd_costs(args):
     cfg = Cfg(args.assets)
     D, F, L, V, KV, HD, H = cfg.D, cfg.F, cfg.L, cfg.V, cfg.KV, cfg.HD, cfg.H
-    per_layer = D * D + 2 * D * KV * HD + D * D + 3 * D * F
+    per_layer = 2 * D * H * HD + 2 * D * KV * HD + 3 * D * F
     lin = L * per_layer
     emb = V * D
     print(f"parameters: layers {lin / 1e6:.2f} M ({per_layer / 1e6:.3f} M/layer), embedding / LM head {emb / 1e6:.2f} M (tied), total {(lin + emb) / 1e6:.2f} M")

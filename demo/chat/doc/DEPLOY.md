@@ -334,6 +334,7 @@ in.  With `cma=1000M` SmolLM2-360M stayed only beside Piper.
 | Piper | 54 MiB | 55 |
 | Moonshine base | 185.8 MiB | 200 |
 | stories15m | 34.8 MiB | 50 |
+| Gemma-3-270M-it | 548.0 MiB | 680 (measured 639–710 MB: set in `llm_models`, the pool formula gives 591) |
 
 - **What is in a pool.**  SmolLM2-135M's, for example, holds one copy of
   every weight (decode reads the prefill image through MatmulKernel's GEMV
