@@ -331,8 +331,8 @@ curl -s http://192.168.100.8:8000/v1/chat/completions -H 'Content-Type: applicat
   in `DEPLOY.md` the backends table, the pool table under "The FPGA and the
   board lock" and the by-hand server command; the test count in the README
   and `DEVELOPMENT.md`.
-- `README.md`: the results table (~line 45) and the supported-models table
-  (~line 346); `doc/README.md`'s CHAT_PLAN line.  Pools are also quoted in
+- `README.md`'s "Results on the board" table, `demo/README.md`'s models table
+  and its chat row; `doc/README.md`'s CHAT_PLAN line.  Pools are also quoted in
   `kv260_chat_server.py`'s docstring, `chat_config.json.example`, and
   model-study (`SKILL.md` §2.2, `llama_fit.py` `RESIDENT`).
 - Commit set: code, tests, docs, `llm_models.json`, the provenance JSON.

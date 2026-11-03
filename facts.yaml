@@ -1744,9 +1744,6 @@ facts:
     - {file: doc/ARCHITECTURE.md, regex: 'with the capture path\s+\(\+(?P<lut>[\d.]+) k\)', format: 'round(v / 1000, 1)'}
     - {file: doc/ARCHITECTURE.md, regex: 'the camera path\s+took (?P<ramb36>\w+) BRAM tiles', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
     - {file: doc/ARCHITECTURE.md, regex: 'the camera path\s+took \w+ BRAM tiles and (?P<uram>\w+) URAM', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
-    - {file: README.md, regex: 'shares nothing with the kernels but the device: (?P<lut>[\d.]+) k LUTs', format: 'round(v / 1000, 1)'}
-    - {file: README.md, regex: 'k LUTs, (?P<ramb36>\w+) block RAMs and', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
-    - {file: README.md, regex: 'block RAMs and\s+(?P<uram>\w+) URAM', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
     - {file: hw/cormorant_hw_128/CLAUDE.md, regex: 'the path takes (?P<ramb36>\w+) RAMB36', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
     - {file: hw/cormorant_hw_128/CLAUDE.md, dotall: true, regex: 'two in the receiver — and (?P<uram>\w+) URAM', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
 
@@ -1946,8 +1943,8 @@ facts:
       speech_chars: {file: demo/chat/kv260_chat_server.py, regex: '^MAX_SPEECH_INPUT = (\d+)', type: int}
   fix: auto
   mentions:
-    - {file: README.md, regex: 'context (?P<context>\d+) \|', count: 4}
-    - {file: README.md, regex: 'up to (?P<speech_chars>\d+) characters'}
+    - {file: demo/README.md, regex: 'context (?P<context>\d+) \|', count: 4}
+    - {file: demo/README.md, regex: 'up to (?P<speech_chars>\d+) characters'}
     - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'the text, up to (?P<speech_chars>\d+) characters'}
     - {file: demo/chat/chat_config.json.example, regex: '"context": (?P<context>\d+),', fix: report}
 
@@ -1962,7 +1959,6 @@ facts:
                 transform: 'round(int(v) * 256 / 22050, 2)'}       # HOP 256, the voice's 22 050 Hz
   fix: auto
   mentions:
-    - {file: README.md, regex: 'one fixed-size chunk \((?P<out_frames>\d+) frames, (?P<seconds>[\d.]+) s of audio\)'}
     - {file: README.md, regex: '\*\*[\d.]+ s\*\* per (?P<seconds>[\d.]+) s of audio'}
     - {file: CLAUDE.md, regex: '(?P<out_frames>\d+) frames = (?P<seconds>[\d.]+) s of audio per pass'}
     - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'chunks of (?P<out_frames>\d+) frames \((?P<seconds>[\d.]+) s of speech\)'}
@@ -2020,7 +2016,7 @@ facts:
     names: {cmd: "make -C build help", transform: "re.findall(r'^\\.\\.\\. (\\S+)', v, re.M)"}
     missing: no make target of build/
     docs:
-      - {file: README.md, start: '^## Quick start', end: '^## Supported models', forward: false, reverse: true,
+      - {file: README.md, start: '^## Quick start', end: '^## Results on the board', forward: false, reverse: true,
          pattern: '\b(Test[A-Z]\w*|synthesize_\w+|build_hw_\w+|dtbo_\w+|behavior_test\w*|sim_hw_\w+|gen_\w+_test_data)\b'}
       - {file: CLAUDE.md, start: '^## Build System', end: '^## Architecture', forward: false, reverse: true,
          pattern: '\bmake +(\w+)'}
@@ -2034,7 +2030,6 @@ facts:
       all: {file: .claude/agents/run-tests/run_tests.py, regex: '^ALL = (\([^)]*\))', transform: "', '.join(ast(v))"}
   fix: auto
   mentions:
-    - {file: README.md, regex: '--suite all` \((?P<all>[\w, -]+)\)'}
     - {file: CLAUDE.md, regex: '--suite all +# (?P<all>[\w, -]+)$'}
     - {file: .claude/agents/run-tests.md, regex: '^\| `default` \| (?P<default>[\w, -]+) \|'}
     - {file: .claude/agents/run-tests.md, regex: '^\| `all` \| (?P<all>[\w, -]+) \(not rtl\)'}
@@ -2102,7 +2097,7 @@ facts:
       - {file: demo/chat/doc/TEXT_TO_SPEECH.md, start: '^# Text to speech', end: '^## Install', pattern: 'samples/(\w+\.mp3)',
          forward: false, reverse: true}
       - {file: demo/chat/README.md, start: '^# KV260 chat server', pattern: 'tts/samples/(\w+\.mp3)', forward: false, reverse: true}
-      - {file: README.md, start: '^## Results on the board', end: '^## Hardware kernels', pattern: 'samples/(\w+\.mp3)',
+      - {file: README.md, start: '^## Results on the board', end: '^## Documentation', pattern: 'samples/(\w+\.mp3)',
          forward: false, reverse: true}
 
 - id: docs.demo_video

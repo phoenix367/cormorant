@@ -4,6 +4,8 @@
   <img src="doc/images/cormorant.png" alt="Cormorant" width="320"/>
 </p>
 
+## Introduction
+
 Five kernels for the Xilinx Kria KV260 (Conv, VectorOP, MatMul, Pooling and
 the row-ops unit, all in SystemVerilog) and a Python code generator that compiles
 ONNX models — CNN classifiers, the YOLOv5n object detector, BERT-base,
@@ -28,56 +30,19 @@ classified on the board.
 > affiliated with, endorsed by or supported by any company, institution or
 > funding programme.
 
----
+What is here:
 
-## Results on the board
-
-KV260, programmable logic at 250 MHz, 16-bit fixed point.  The production bitstream
-since 2026-10-28 is `b4e63457057a`: the 250 MHz design of
-[FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) with VectorOPKernel's activation unit
-([ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md)) and softmax unit
-([SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md)), its second read port on a PS port of its
-own ([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)), ConvKernel's x port past the CCI
-([DEPTHWISE_PLAN](doc/plans/DEPTHWISE_PLAN.md) §8), the row-ops unit, a fifth kernel
-that runs the transformers' norms, residual adds and SiLU·up and Piper's flow
-inputs in fixed point ([HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md)), with its GATE op
-and SCALE flag ([RPU_PLAN](doc/plans/RPU_PLAN.md) §14), the kernels' second area pass
-([AREA_PLAN](doc/plans/AREA_PLAN.md) §6) and the MIPI camera's capture path
-([demo/camera](demo/camera/README.md)).
-
-The results were measured 2026-10-18 on `04259a7af917`, the production bitstream
-before it (the kernels before their second area pass, no camera path): every
-kernel call runs as fast on `b4e63457057a` (its performance model and the 72
-kernel benchmarks, AREA_PLAN §6.5), and these figures were not measured again.  The
-chat models', Piper's and Moonshine's figures are from 2026-10-17 (RPU_PLAN §14.12,
-ASR_PLAN); the chat-server Piper figures from 2026-10-01, at 100 MHz; the camera's
-from 2026-10-27 on `b4e63457057a`.  The board ran the A53's interrupt waits and, as
-a soak test, the cores' deep idle state (about 2 % on the chat decode).
-
-| Model | Result | Source |
-|---|---|---|
-| ResNet-18, 224×224 | **20.0 ms (50.0 FPS)** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md) (20.5 ms with VectorOP's two reads on one PS port; 47.4 ms at 100 MHz, [CONV_RTL_PLAN](doc/plans/CONV_RTL_PLAN.md); 59.9 ms on the HLS ConvKernel, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
-| MobileNet V1 / V2, 224×224 | **20.5 / 17.6 ms** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (41.2 / 38.1 ms at 100 MHz) |
-| LightStereo-S stereo depth, 640×480 | **469 ms (2.13 FPS)** per pair, EPE 0.667 px on 42 Middlebury / ETH3D pairs (float 0.650 on the same input); 133 ms at 320×256; RealSense D435 pairs taken on the board: depth within 10 % of the camera's own on 91 % of the pixels (projector on) | [STEREO_PLAN](doc/plans/STEREO_PLAN.md), [demo/stereo_depth](demo/stereo_depth/README.md) |
-| YOLOv5n object detection, 640×640 | **47.6 ms (21.0 FPS)** per image (the network on the FPGA; decode + NMS on the host), COCO128 mAP@0.5:0.95 0.343 (float 0.349) | [YOLO_PLAN](doc/plans/YOLO_PLAN.md), [demo/object_detection](demo/object_detection/README.md) |
-| MNIST convnet / LeNet | 0.115 / 1.232 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
-| BERT-base SQuAD (bertsquad-12, 256 tokens) | **267 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md) (427 ms with both VectorOP reads on one PS port), [SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md) (525 ms with the softmax on the host), [ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md) (541 ms with the GELUs on the host too; 839 ms at 100 MHz, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md)) |
-| SmolLM2-135M-Instruct | **20.4 tokens/s** decode, 16-token prefill 0.08 s, 256-token prefill 0.39 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) |
-| SmolLM2-360M-Instruct | **7.8 tokens/s** decode, 16-token prefill 0.19 s, 256-token prefill 1.02 s, 758 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
-| SmolVLM-256M-Instruct (image chat) | **1.6 s** per image for the vision encoder (7.7 s at first), then 49 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md) |
-| stories15M (TinyStories story writing, llama2.c) | **6.0 ms** per token decode (~166 tokens/s), 255-token prefill 32 ms, 35 MiB CMA; perplexity 3.322 (float 3.314) | [CHAT_PLAN §27](doc/plans/CHAT_PLAN.md), [Stories](demo/chat/doc/STORIES.md) |
-| Gemma-3-270M-it (QK-norm, GELU MLP, 512-token sliding windows, 262k vocabulary) | **11.4 tokens/s** decode (87.7 ms per token), 16-token prefill 0.14 s, 256-token prefill 0.57 s, 548 MiB pool; perplexity 36.96 (float 36.75) | [CHAT_PLAN §31](doc/plans/CHAT_PLAN.md) |
-| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.15 s** per 1.49 s of audio (real-time factor 0.11), text encoder 24 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md), [samples](demo/tts/README.md#samples) |
-| MobileNet V1 on the AR1335 MIPI camera, 640×480 | **20.7 ms** per frame, about 16 frames/s end to end with the annotated frames streamed to the host | [demo/camera](demo/camera/README.md) |
-| Moonshine base (speech to text, English) | **1.10 s** per LibriSpeech utterance (8.4 s of audio on average, RTF 0.13), WER 2.93 % (float 3.02 %); through the chat server 1.3 s for 10 s of audio | [ASR_PLAN §6–§7](doc/plans/ASR_PLAN.md), [Speech to text](demo/chat/doc/SPEECH_TO_TEXT.md) |
-| SmolVLA (vision-language-action, `lerobot/smolvla_base`) | **3.96 s** per chunk of 50 actions from two 480×640 cameras (1.31 s per camera image, 0.47 s prefix, 0.86 s for the ten denoising steps); actions within 4.0 % of float with the same noise (the policy's own spread between two noise samples: 66 %), bit-exact with the specification on 24 SO100 samples | [VLA_PLAN](doc/plans/VLA_PLAN.md), [demo/vla](demo/vla/README.md) |
-
-The BERT, SmolLM2 and SmolVLM logits, the YOLOv5n head maps and the Piper
-audio samples are bit-exact with the scheduler's simulation; Moonshine's
-transcripts with its specification, token for token.
-The FPGA design (`hw/cormorant_hw_128`, bitstream `b4e63457057a`) uses 68 % of the DSPs
-(845 / 1248), 74.3 % of the LUTs (87 013 / 117 120), 142 / 144 BRAM and
-58 / 64 URAM.
+- **Five FPGA kernels** in SystemVerilog, each with its C++ reference model and
+  Verilator testbench (`kernels/`), and the Vivado block design that holds them
+  (`hw/cormorant_hw_128`, a submodule) — [System architecture](#system-architecture).
+- **The inference scheduler** (`inference-scheduler/`): ONNX models and
+  Hugging Face checkpoints in, C projects and libraries out, with a fixed-point
+  simulator that predicts every output bit.
+- **Demos** (`demo/`): image classification, object detection, stereo depth,
+  the live camera, BERT question answering, the chat server (chat, image chat,
+  text to speech, speech to text), a voice assistant and a robot policy —
+  [demo/README.md](demo/README.md), with the [validated models](demo/README.md#models)
+  and where to get them.
 
 ---
 
@@ -100,11 +65,7 @@ document (requirements, interconnect and control path, clocks and reset,
 memory, datapath, interfaces, verification, timing and utilization); the
 diagram is drawn by [`doc/images/architecture.py`](doc/images/architecture.py).
 
----
-
-## Hardware kernels
-
-All five kernels are written in SystemVerilog.  The first four are drop-ins
+**The kernels.**  All five are written in SystemVerilog.  The first four are drop-ins
 for the Vitis HLS kernels they replaced, whose C++ stays as the reference
 model in each kernel's `model/` directory; the row-ops unit was written
 against an integer specification in Python.  All data
@@ -122,113 +83,24 @@ bounds come from [`platforms/kv260.json`](platforms/kv260.json).
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool` and the Global variants | SystemVerilog: 8 channel lanes, windows ≤ 7×7, two output positions per cycle, dilation, `count_include_pad` | [POOL_RTL_KERNEL](doc/kernels/POOL_RTL_KERNEL.md) |
 | **RowOpsKernel** (the row-ops unit) | `LayerNormalization`, BERT's `Transpose`s; the transformer frontends' residual adds, RMSNorms, SiLU · up, RoPE, dequantisation, KV-cache copies | SystemVerilog: 4 lanes per cycle on rows of ≤ 4096 elements, int32 residual rows and float32 output, per-column parameters and the sigmoid / rsqrt tables in UltraRAM; bit-exact with a Python integer specification | [ROWOPS_RTL_KERNEL](doc/kernels/ROWOPS_RTL_KERNEL.md), [HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md) |
 
-The Vivado block design (a git submodule, `hw/cormorant_hw_128`) streams the
-weights — ConvKernel `weight` / `bias` and MatmulKernel's second read port —
-and VectorOPKernel's second operand (`b`) through PS port `S_AXI_HPC1_FPD`; the
-other data ports share `S_AXI_HPC0_FPD`, except ConvKernel's `x`, which has
-`S_AXI_HP2_FPD` to itself, and the row-ops unit, on `S_AXI_HP0_FPD`.  The `b`
-port's move made binary VectorOP calls 24–38 % faster
-([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)); `x` on HP2 made the depthwise
-and few-channel 1 × 1 convolutions 27–67 % faster
-([DEPTHWISE_PLAN](doc/plans/DEPTHWISE_PLAN.md) §8).
-MatmulKernel reads A and B through both of its read ports.
+The PS ports each kernel uses, the interconnect and the camera capture path are in
+[`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) (§6.6 for the camera).
 
-The block design also holds the camera capture path
-(`hw/cormorant_hw_128/scripts/bd_mipi_capture.tcl`): a MIPI CSI-2 receiver for
-the carrier's AR1335 / AP1302 camera (4 lanes, bank 66) and a frame-buffer
-writer that puts NV12 frames into DDR through `S_AXI_HP3_FPD`, on their own
-200 MHz clock, controlled over `M_AXI_HPM0_LPD` by Linux's V4L2 drivers.  It
-shares nothing with the kernels but the device: 7.4 k LUTs, six block RAMs and
-one URAM ([`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) §6.6).
-
----
-
-## Inference scheduler
-
-[`inference-scheduler/`](inference-scheduler/) turns an ONNX model into a C
-project (`CMakeLists.txt`, `inference.c`, weights in `.dat` files, a test
-program) for Linux with XRT buffers or for bare metal:
-
-- **Kernel mapping** — element-wise ops on VectorOP (`LeakyRelu`, SiLU and
-  `Gelu` on its activation unit, fused into a producing Add / Mul where they
-  can be; `Softmax` rows on its softmax unit), MatMuls on MatmulKernel or,
-  where a cost model says it is faster, on ConvKernel with swapped operand
-  roles; `Gemm` is decomposed, `Reshape`-class ops and contiguous
-  `Split` / `Slice` pieces are free views.
-- **Host-CPU ops** for what no kernel implements — `Concat`, `Resize`
-  (nearest upsampling), `Gather`, `OneHot`, `Cast`, `SpaceToDepth`, and
-  `Softmax` / `Gelu` where the VectorOP units do not apply, `LayerNormalization`
-  / `Transpose` where the row-ops unit does not — with the LayerNorm / GELU
-  subgraphs of exported BERT models fused into single ops, and a host thread pool.
-- **Llama-family decoders** — a frontend reads `config.json` + safetensors and
-  builds decode / prefill / head graphs with RMSNorm, RoPE, SiLU and an int32
-  residual stream on the row-ops unit (host ops and a float residual stream
-  without it); attention reads the KV cache on ConvKernel
-  (q·Kᵀ and P·V, prefill and decode), with the prefill's softmax on
-  VectorOP's softmax unit.  Per-channel power-of-two exponents fit the model
-  into Q8.8.  Several graphs share one library and weight pool (`--entry`).  A
-  ViT frontend (SmolVLM's SigLIP-style encoder + connector) adds a `vision`
-  entry whose image features feed the decoder's prefill; its attention runs
-  on ConvKernel, its softmax and 11 of its 12 GELUs on VectorOP.
-- **Text to speech** — a Piper (VITS) frontend writes the flow and the
-  HiFi-GAN decoder as one fixed-size chunk (128 frames, 1.49 s of audio):
-  66 ConvKernel convolutions with power-of-two exponents per chunk.
-  - The text encoder runs as length-bucketed entries, with its projections
-    and attention on ConvKernel and its attention softmax on VectorOP's
-    softmax unit.
-  - The duration predictor runs as C code in the library.
-  - 1-D convolutions are folded into rows.
-  - Transposed convolutions run polyphase.
-  - The decoder's residual sums are VectorOP `Add`s; the gates, the other
-    sums, the LeakyReLU preps and the interleaves run on the row-ops unit;
-    the flows' float preps and outputs and the PCM conversion are host ops.
-  - Consecutive chunks join into one waveform bit for bit.
-- **Speech to text** — a Moonshine frontend writes the encoder as four
-  length buckets (3.1 / 6.2 / 12.3 / 24.6 s of 16 kHz audio, the valid
-  length a runtime input) and the decoder as one greedy step.
-  - The conv stem runs on ConvKernel over folded rows, with host ops for
-    tanh, GroupNorm and GELU from tables.
-  - The encoder's attention runs on ConvKernel with VectorOP's softmax unit
-    over the valid keys; its LayerNorms, residuals and RoPE run on the
-    row-ops unit, and its GELUs on VectorOP's activation unit.
-  - The decoder reads the cross-attention caches the encoder wrote.
-  - The library splits long audio at quiet points.
-- **Scheduling** — kernels on different lanes run concurrently; one weak
-  `kernel_wait()` does the synchronisation; intermediate buffers share pool
-  slots by event-stream liveness; cache clean / invalidate calls are emitted
-  wherever the CPU and the FPGA share a buffer.
-- **Planning (optional, `--plan`)** — MatMul tactics and the issue order
-  chosen from performance models of the bitstream, measured once on the
-  board (`perf_calibrate.py`); results stay bit-identical, and without
-  `--plan` nothing changes ([TACTICS_PLAN §9](doc/plans/TACTICS_PLAN.md)).
-- **Checking** — a fixed-point simulator produces the expected outputs the
-  generated test compares bit for bit; `report.md` summarises the model,
-  memory and quantisation error.
-
-Reference (ops, numerics, generated code):
-[doc/scheduler/INFERENCE_SCHEDULER.md](doc/scheduler/INFERENCE_SCHEDULER.md); CLI, generated project and C
-API: [inference-scheduler/doc/USER_GUIDE.md](inference-scheduler/doc/USER_GUIDE.md).
-
----
-
-## Demos
-
-Each demo takes a model to a running KV260 program; see
-[demo/README.md](demo/README.md).
-
-| Demo | What it runs |
-|---|---|
-| [`demo/mnist/`](demo/mnist/) | MNIST convnet and LeNet over the 10 000 test images: accuracy and per-image latency |
-| [`demo/image_classification/`](demo/image_classification/) | MobileNet V1 / V2 and ResNet-18: top-5 ImageNet predictions for your images |
-| [`demo/object_detection/`](demo/object_detection/) | YOLOv5n object detection (COCO's 80 classes): boxes drawn on COCO128 or your pictures, mAP against float |
-| [`demo/stereo_depth/`](demo/stereo_depth/) | LightStereo-S stereo depth: disparity maps of Middlebury / ETH3D pairs, your rectified pairs or a RealSense D4xx on the board (`--capture`); EPE against the ground truth, depth against the camera's own |
-| [`demo/camera/`](demo/camera/) | MobileNet V1 on live camera frames — a RealSense on USB, or the KV260's AR1335 / AP1302 MIPI camera through the block design's capture path — annotated frames streamed back over SSH |
-| [`demo/bert_squad/`](demo/bert_squad/) | BERT-base extractive question answering on SQuAD 1.1 |
-| [`demo/chat/`](demo/chat/) | An OpenAI-compatible server on the board, usable from `chat.py` (which can read answers aloud) or any OpenAI client: BERT document QA, SmolLM2-135M / 360M generative chat, SmolVLM-256M chat about images, Gemma-3-270M chat, stories15M story writing (`/v1/completions`), Piper text to speech (`/v1/audio/speech`) and Moonshine speech to text (`/v1/audio/transcriptions`) |
-| [`demo/tts/`](demo/tts/) | Piper text to speech: the numeric study, `libpiper_tts.so` and its board gate (audio bit-exact with the specification) |
-| [`demo/asr/`](demo/asr/scripts/) | Moonshine speech to text: the study (Whisper and Moonshine screened), the bit-level specification, `libmoonshine_<size>.so` and its host-emulation and board gates (token ids bit-exact with the specification) |
-| [`demo/vla/`](demo/vla/) | SmolVLA vision-language-action: camera frames + a task + the robot's state -> 50 actions; the study, the bit-level specification, `libsmolvla.so` (with a ctypes wrapper) and its host-emulation and board gates (actions bit-exact with the specification) |
-| [`demo/miranda/`](demo/miranda/) | Miranda, a voice assistant: say "Hello Miranda" and a request; the console client streams the microphone to the board (RTP), which detects speech (VAD on the CPU), recognizes the key phrase and the request (Moonshine), answers (SmolLM2) and speaks (Piper) through the chat server |
+**The inference scheduler** ([`inference-scheduler/`](inference-scheduler/)) maps an
+ONNX graph onto the kernels and the A53 cores and writes a C project
+(`CMakeLists.txt`, `inference.c`, weights in `.dat` files, a test program) for Linux
+with XRT buffers or for bare metal.  It puts each MatMul on MatmulKernel or
+ConvKernel by a cost model, fuses activations into a producing op, runs what no
+kernel implements (LayerNorm / GELU subgraphs, `Concat`, `Resize`, `Gather`, …) as
+host ops, and overlaps kernels on different lanes with pool slots shared by
+liveness.  Frontends write the graphs of models ONNX does not carry well — Llama-family
+and Gemma 3 decoders with their KV caches, a ViT vision encoder, Piper (VITS) text to
+speech, Moonshine speech to text, SmolVLA, LightStereo-S — with per-tensor
+power-of-two exponents instead of the fixed `ap_fixed<16,8>` (8 fractional bits).
+An optional planner (`--plan`) picks MatMul tactics and the issue order from the
+bitstream's measured performance model.  Reference:
+[INFERENCE_SCHEDULER.md](doc/scheduler/INFERENCE_SCHEDULER.md); CLI, generated
+project and C API: [USER_GUIDE.md](inference-scheduler/doc/USER_GUIDE.md).
 
 ---
 
@@ -254,8 +126,8 @@ ctest
 
 Or build them one by one: `make TestVectorOpModel TestConvModel TestConvModelGrid
 TestMatmulModel TestPoolModel` (the reference models; + `TestMatmulModelBlas` with a
-BLAS) and `TestMatmulRtl TestVectorOpRtl TestPoolRtl TestConvRtl TestRowOpsRtl` (the
-SystemVerilog kernels, with Verilator 5.x).
+BLAS) and `TestMatmulRtl TestVectorOpRtl TestPoolRtl TestConvRtl TestRowOpsRtl`
+(Verilator 5.x for the five RTL kernels).
 
 ### 3. The scheduler and its tests
 
@@ -356,64 +228,61 @@ cp remote_config.json.example remote_config.json                     # set ssh.h
 
 or run a demo: `cd demo/<name>` and follow its README.
 
+Every test layer — the RTL behaviour tests, the board's kernel benchmarks, the
+fact registry, and `run_tests.py`, which runs the host ones into one report — is in
+[doc/build-and-test/TESTING.md](doc/build-and-test/TESTING.md) and
+[REMOTE_TESTING.md](inference-scheduler/doc/REMOTE_TESTING.md).
+
 ---
 
-## Testing
+## Results on the board
 
-| Layer | Needs | Command |
+KV260, programmable logic at 250 MHz, 16-bit fixed point.  The production bitstream
+since 2026-10-28 is `b4e63457057a`: the 250 MHz design of
+[FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) with VectorOPKernel's activation unit
+([ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md)) and softmax unit
+([SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md)), its second read port on a PS port of its
+own ([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)), ConvKernel's x port past the CCI
+([DEPTHWISE_PLAN](doc/plans/DEPTHWISE_PLAN.md) §8), the row-ops unit, a fifth kernel
+that runs the transformers' norms, residual adds and SiLU·up and Piper's flow
+inputs in fixed point ([HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md)), with its GATE op
+and SCALE flag ([RPU_PLAN](doc/plans/RPU_PLAN.md) §14), the kernels' second area pass
+([AREA_PLAN](doc/plans/AREA_PLAN.md) §6) and the MIPI camera's capture path
+([demo/camera](demo/camera/README.md)).
+
+The results were measured 2026-10-18 on `04259a7af917`, the production bitstream
+before it (the kernels before their second area pass, no camera path): every
+kernel call runs as fast on `b4e63457057a` (its performance model and the 72
+kernel benchmarks, AREA_PLAN §6.5), and these figures were not measured again.  The
+chat models', Piper's and Moonshine's figures are from 2026-10-17 (RPU_PLAN §14.12,
+ASR_PLAN); the chat-server Piper figures from 2026-10-01, at 100 MHz; the camera's
+from 2026-10-27 on `b4e63457057a`.  The board ran the A53's interrupt waits and, as
+a soak test, the cores' deep idle state (about 2 % on the chat decode).
+
+| Model | Result | Source |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1934<!-- /fact --> tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->335<!-- /fact --> tests; ~75 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, and `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
-| Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the five RTL kernels) | `make -j8 && ctest` in `build/` |
-| RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
-| On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
-| On-board kernel benchmarks | KV260 over SSH, bitstream loaded | `run_remote_perf.py --config perf_config.json` |
-| Facts in code and docs | Python, PyYAML | `python3 tools/facts/facts.py check`: the counts, register maps, supported ops, flags, routes, bounds and board results that several files state ([`facts.yaml`](facts.yaml), [tools/facts](tools/facts/README.md)); `install-hook` makes every `git commit` check the ones it touches |
-| All host layers, one report | as above | `python3 .claude/agents/run-tests/run_tests.py --suite all` (scheduler, chat, lint, facts, csim, tts-host): pytest, ruff, the fact registry, the kernel C simulation and the Piper host checks, with failures, unexpected skips, warnings and short runs as JSON; in Claude Code, the `run-tests` subagent |
+| ResNet-18, 224×224 | **20.0 ms (50.0 FPS)** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md) (20.5 ms with VectorOP's two reads on one PS port; 47.4 ms at 100 MHz, [CONV_RTL_PLAN](doc/plans/CONV_RTL_PLAN.md); 59.9 ms on the HLS ConvKernel, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
+| MobileNet V1 / V2, 224×224 | **20.5 / 17.6 ms** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (41.2 / 38.1 ms at 100 MHz) |
+| LightStereo-S stereo depth, 640×480 | **469 ms (2.13 FPS)** per pair, EPE 0.667 px on 42 Middlebury / ETH3D pairs (float 0.650 on the same input); 133 ms at 320×256; RealSense D435 pairs taken on the board: depth within 10 % of the camera's own on 91 % of the pixels (projector on) | [STEREO_PLAN](doc/plans/STEREO_PLAN.md), [demo/stereo_depth](demo/stereo_depth/README.md) |
+| YOLOv5n object detection, 640×640 | **47.6 ms (21.0 FPS)** per image (the network on the FPGA; decode + NMS on the host), COCO128 mAP@0.5:0.95 0.343 (float 0.349) | [YOLO_PLAN](doc/plans/YOLO_PLAN.md), [demo/object_detection](demo/object_detection/README.md) |
+| MNIST convnet / LeNet | 0.115 / 1.232 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
+| BERT-base SQuAD (bertsquad-12, 256 tokens) | **267 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md) (427 ms with both VectorOP reads on one PS port), [SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md) (525 ms with the softmax on the host), [ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md) (541 ms with the GELUs on the host too; 839 ms at 100 MHz, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md)) |
+| SmolLM2-135M-Instruct | **20.4 tokens/s** decode, 16-token prefill 0.08 s, 256-token prefill 0.39 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) |
+| SmolLM2-360M-Instruct | **7.8 tokens/s** decode, 16-token prefill 0.19 s, 256-token prefill 1.02 s, 758 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
+| SmolVLM-256M-Instruct (image chat) | **1.6 s** per image for the vision encoder (7.7 s at first), then 49 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md) |
+| stories15M (TinyStories story writing, llama2.c) | **6.0 ms** per token decode (~166 tokens/s), 255-token prefill 32 ms, 35 MiB CMA; perplexity 3.322 (float 3.314) | [CHAT_PLAN §27](doc/plans/CHAT_PLAN.md), [Stories](demo/chat/doc/STORIES.md) |
+| Gemma-3-270M-it (QK-norm, GELU MLP, 512-token sliding windows, 262k vocabulary) | **11.4 tokens/s** decode (87.7 ms per token), 16-token prefill 0.14 s, 256-token prefill 0.57 s, 548 MiB pool; perplexity 36.96 (float 36.75) | [CHAT_PLAN §31](doc/plans/CHAT_PLAN.md) |
+| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.15 s** per 1.49 s of audio (real-time factor 0.11), text encoder 24 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md), [samples](demo/tts/README.md#samples) |
+| MobileNet V1 on the AR1335 MIPI camera, 640×480 | **20.7 ms** per frame, about 16 frames/s end to end with the annotated frames streamed to the host | [demo/camera](demo/camera/README.md) |
+| Moonshine base (speech to text, English) | **1.10 s** per LibriSpeech utterance (8.4 s of audio on average, RTF 0.13), WER 2.93 % (float 3.02 %); through the chat server 1.3 s for 10 s of audio | [ASR_PLAN §6–§7](doc/plans/ASR_PLAN.md), [Speech to text](demo/chat/doc/SPEECH_TO_TEXT.md) |
+| SmolVLA (vision-language-action, `lerobot/smolvla_base`) | **3.96 s** per chunk of 50 actions from two 480×640 cameras (1.31 s per camera image, 0.47 s prefix, 0.86 s for the ten denoising steps); actions within 4.0 % of float with the same noise (the policy's own spread between two noise samples: 66 %), bit-exact with the specification on 24 SO100 samples | [VLA_PLAN](doc/plans/VLA_PLAN.md), [demo/vla](demo/vla/README.md) |
 
-Details: [doc/build-and-test/TESTING.md](doc/build-and-test/TESTING.md),
-[inference-scheduler/doc/REMOTE_TESTING.md](inference-scheduler/doc/REMOTE_TESTING.md).
-
----
-
-## Supported models
-
-Validated end to end (generate → run on the board → compare with the Python
-ground truth).  The CNN links are already simplified with
-[`simplify_onnx.py`](inference-scheduler/simplify_onnx.py); see
-[MODEL_PREPARATION.md](inference-scheduler/doc/MODEL_PREPARATION.md) for your
-own models.
-
-| Model | Input | Task |
-|---|---|---|
-| [ConvMNIST](https://drive.google.com/file/d/1a-A-t2JBC9r5IaEjpWp9915n0wBoIj0y) | `1×1×28×28` | MNIST digit classifier (small convnet) |
-| [LeNet](https://drive.google.com/file/d/1tNQe_wDvVzuPnEMJvIzeULMZrUlYS7VF) | `1×1×28×28` | LeNet-5 on MNIST |
-| [MobileNet V1](https://drive.google.com/file/d/1PzFSPkXpkIpiKfyo8tORl2AkfXgjdQvw) | `1×3×224×224` | ImageNet classifier (depthwise-separable) |
-| [MobileNet V2](https://drive.google.com/file/d/1ti97y2P_Fc8TRUk0oVm_AG7yrmk5Fuw1) | `1×3×224×224` | ImageNet classifier (inverted residuals) |
-| [ResNet-18](https://drive.google.com/file/d/1DKyALYam5jAzMSK8ulgFQuSbQ62-EVvr) | `1×3×224×224` | ImageNet classifier (residual blocks) |
-| [YOLOv5n](https://github.com/ultralytics/yolov5/releases/tag/v7.0) (Ultralytics v7.0 ONNX; the demo cuts it at its Detect convs) | `1×3×640×640` | object detection, COCO's 80 classes ([demo/object_detection](demo/object_detection/README.md)) |
-| [LightStereo-S](https://huggingface.co/XiandaGuo/OpenStereo) (OpenStereo, StereoAnything weights; PyTorch checkpoint, compiled by `src/stereo.py`) | two `1×3×480×640` images | stereo depth: disparity of a rectified pair ([demo/stereo_depth](demo/stereo_depth/README.md)) |
-| bertsquad-12 (ONNX model zoo) | 256 tokens | extractive QA ([demo/bert_squad](demo/bert_squad/README.md)) |
-| SmolLM2-135M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
-| SmolLM2-360M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
-| SmolVLM-256M-Instruct (Hugging Face safetensors) | one 512×512 image + text, context 1024 | chat about images ([demo/chat](demo/chat/README.md)) |
-| stories15M ([nickypro/tinyllama-15M](https://huggingface.co/nickypro/tinyllama-15M): Karpathy's llama2.c model, Hugging Face safetensors) | text, up to 256 tokens of context | story writing: text completion ([demo/chat](demo/chat/doc/STORIES.md)) |
-| Gemma-3-270M-it ([unsloth/gemma-3-270m-it](https://huggingface.co/unsloth/gemma-3-270m-it): Google's Gemma 3, Gemma terms of use; safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
-| Piper en_US-lessac-medium ([rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) ONNX) | text, up to 4096 characters (espeak-ng phonemes) | text to speech ([demo/tts](demo/tts/README.md), [demo/chat](demo/chat/doc/TEXT_TO_SPEECH.md)) |
-| Moonshine base / tiny ([UsefulSensors/moonshine-base](https://huggingface.co/UsefulSensors/moonshine-base), safetensors) | 16 kHz audio, any length (parts of up to 24.6 s) | speech to text ([demo/asr](demo/asr/scripts/), [demo/chat](demo/chat/doc/SPEECH_TO_TEXT.md)) |
-| SmolVLA ([lerobot/smolvla_base](https://huggingface.co/lerobot/smolvla_base), safetensors) | 1–3 camera frames (any size), a task's tokens, the robot's state | robot actions: a chunk of 50 ([demo/vla](demo/vla/README.md)) |
-
----
-
-## Data type
-
-`ap_fixed<16,8>`: 16-bit two's complement with 8 fractional bits
-(`1.0 = 0x0100`, range `[−128, 127.996]`), saturating.  The scheduler's
-`DataType` abstraction (`inference-scheduler/src/dtype.py`) also supports
-`float32`.  For the decoders and Piper's convolutions, per-tensor /
-per-channel power-of-two exponents ([CHAT_PLAN §10](doc/plans/CHAT_PLAN.md),
-[TTS_PLAN §3](doc/plans/TTS_PLAN.md)) scale each tensor into 16 bits instead
-of the fixed 8 fractional bits.
+The BERT, SmolLM2 and SmolVLM logits, the YOLOv5n head maps and the Piper
+audio samples are bit-exact with the scheduler's simulation; Moonshine's
+transcripts with its specification, token for token.
+The FPGA design (`hw/cormorant_hw_128`, bitstream `b4e63457057a`) uses 68 % of the DSPs
+(845 / 1248), 74.3 % of the LUTs (87 013 / 117 120), 142 / 144 BRAM and
+58 / 64 URAM.
 
 ---
 
@@ -424,12 +293,12 @@ and every document with a one-line summary:
 
 | Folder | Topic |
 |---|---|
-| [`doc/build-and-test/`](doc/build-and-test/) | build targets, test layers, platform JSON, RTL simulation issues |
-| [`doc/kernels/`](doc/kernels/) | per kernel: a reference and an optimisation log |
+| [`doc/build-and-test/`](doc/build-and-test/) | build targets, test layers ([TESTING.md](doc/build-and-test/TESTING.md)), platform JSON, RTL simulation issues |
+| [`doc/kernels/`](doc/kernels/) | per kernel: a reference and an optimisation log; [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md): the hardware architecture |
 | [`doc/scheduler/`](doc/scheduler/) | the scheduler reference and the profiler |
 | [`inference-scheduler/doc/`](inference-scheduler/doc/) | scheduler user guide, architecture, DAG, model preparation, board testing |
 | [`doc/plans/`](doc/plans/) | project plans and their measured results |
-| [`demo/`](demo/README.md) | one README per demo |
+| [`demo/`](demo/README.md) | one README per demo, and the validated models with their sources |
 | [`tools/facts/`](tools/facts/README.md) | the fact registry ([`facts.yaml`](facts.yaml)): facts that code and docs repeat, checked by `facts.py` and a pre-commit hook |
 | [`tools/cpu_baseline/`](tools/cpu_baseline/README.md) | the FPGA's BERT, SmolLM2, SmolVLM, Piper and Moonshine results against onnxruntime on the board's four A53 cores (BERT_PLAN §4, CHAT_PLAN §26, TTS_PLAN §8, ASR_PLAN §9) |
 

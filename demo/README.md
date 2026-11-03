@@ -25,10 +25,38 @@ speech-to-text library of its `moonshine` backend.
 | [`object_detection/`](object_detection/) | YOLOv5n (Ultralytics v7.0, 640 × 640) | COCO128 images, your JPG/PNG files | Boxes and classes drawn on each image: the network on ConvKernel + VectorOPKernel + PoolingKernel (48 ms per image, 21.0 FPS) on bitstream `04259a7af917`, decode + NMS on the host; COCO128 mAP@0.5:0.95 0.343 against float's 0.349, head maps bit-exact vs the scheduler simulation |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
 | [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + RowOpsKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (267 ms per inference) on bitstream `04259a7af917` |
-| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Piper lessac-medium, Moonshine base | chat messages (and images), text to speak, audio to transcribe, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions`, `/v1/audio/speech` and `/v1/audio/transcriptions`, streaming), backends `bert-squad`, `smollm2`, `smollm2-360m`, `smolvlm`, `piper` and `moonshine`: question answering over a user-supplied document (~0.27 s per 256-token window on bitstream `04259a7af917`), generative multi-turn chat (SmolLM2-135M ~20.4 tokens/s, 360M ~7.8 tokens/s on bitstream `04259a7af917`), questions about images sent as OpenAI `image_url` parts (1.6 s per image, then ~20 tokens/s on bitstream `04259a7af917`), text to speech (first sound after 1.0–1.5 s at 100 MHz, faster than real time) and speech to text; works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud); [demo video](https://youtu.be/VVS7ExW0XYQ) |
+| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Gemma-3-270M-it, stories15M, Piper lessac-medium, Moonshine base | chat messages (and images), text to speak, audio to transcribe, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions`, `/v1/audio/speech` and `/v1/audio/transcriptions`, streaming), backends `bert-squad`, `smollm2`, `smollm2-360m`, `smolvlm`, `piper` and `moonshine`: question answering over a user-supplied document (~0.27 s per 256-token window on bitstream `04259a7af917`), generative multi-turn chat (SmolLM2-135M ~20.4 tokens/s, 360M ~7.8 tokens/s on bitstream `04259a7af917`), questions about images sent as OpenAI `image_url` parts (1.6 s per image, then ~20 tokens/s on bitstream `04259a7af917`), text to speech (first sound after 1.0–1.5 s at 100 MHz, faster than real time) and speech to text; works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud); [demo video](https://youtu.be/VVS7ExW0XYQ) |
 | [`tts/`](tts/) | Piper en_US-lessac-medium (VITS) | sentences | The numeric study, `libpiper_tts.so` (flow + HiFi-GAN on ConvKernel, 0.15 s per 1.49 s of audio; the text encoder on the FPGA and the duration predictor in C too) and its board gate: audio bit-exact with the specification; the library serves the chat server's `piper` backend |
 | [`asr/`](asr/) | Moonshine base / tiny (UsefulSensors) | LibriSpeech test-clean utterances, your WAV files (through the chat server) | The numeric study, `libmoonshine_<size>.so` (the encoder and the greedy decoder on the FPGA, a 10 s recording in 1.3 s through the server) and its board gate: every token id bit-exact with the specification, WER 2.93 % (base); the library serves the chat server's `moonshine` backend |
 | [`miranda/`](miranda/) | Moonshine base, SmolLM2-360M-Instruct, Piper lessac-medium (through the chat server) | the microphone (RTP from a console client) | A voice assistant: "Hello Miranda" and a request; voice activity detection on the board's CPU, the key phrase found in the transcripts, the answer streamed as text and spoken back; the microphone muted while Miranda thinks and speaks; a dialogue mode without the key phrase (by voice, `--dialogue` or `d` + Enter) that ends after silence |
+| [`vla/`](vla/) | SmolVLA (lerobot/smolvla_base) | 1–3 camera frames, a task, the robot's state | Vision-language-action: 50 actions per chunk (3.96 s from two cameras); the study, the bit-level specification, `libsmolvla.so` (with a ctypes wrapper) and its host-emulation and board gates (actions bit-exact with the specification) |
+
+## Models
+
+Every model the demos run, validated end to end (generate → run on the board → compare
+with the Python ground truth).  The CNN links are already simplified with
+[`simplify_onnx.py`](../inference-scheduler/simplify_onnx.py); see
+[MODEL_PREPARATION.md](../inference-scheduler/doc/MODEL_PREPARATION.md) for your
+own models.
+
+| Model | Input | Task |
+|---|---|---|
+| [ConvMNIST](https://drive.google.com/file/d/1a-A-t2JBC9r5IaEjpWp9915n0wBoIj0y) | `1×1×28×28` | MNIST digit classifier (small convnet) |
+| [LeNet](https://drive.google.com/file/d/1tNQe_wDvVzuPnEMJvIzeULMZrUlYS7VF) | `1×1×28×28` | LeNet-5 on MNIST |
+| [MobileNet V1](https://drive.google.com/file/d/1PzFSPkXpkIpiKfyo8tORl2AkfXgjdQvw) | `1×3×224×224` | ImageNet classifier (depthwise-separable) |
+| [MobileNet V2](https://drive.google.com/file/d/1ti97y2P_Fc8TRUk0oVm_AG7yrmk5Fuw1) | `1×3×224×224` | ImageNet classifier (inverted residuals) |
+| [ResNet-18](https://drive.google.com/file/d/1DKyALYam5jAzMSK8ulgFQuSbQ62-EVvr) | `1×3×224×224` | ImageNet classifier (residual blocks) |
+| [YOLOv5n](https://github.com/ultralytics/yolov5/releases/tag/v7.0) (Ultralytics v7.0 ONNX; the demo cuts it at its Detect convs) | `1×3×640×640` | object detection, COCO's 80 classes ([demo/object_detection](object_detection/README.md)) |
+| [LightStereo-S](https://huggingface.co/XiandaGuo/OpenStereo) (OpenStereo, StereoAnything weights; PyTorch checkpoint, compiled by `src/stereo.py`) | two `1×3×480×640` images | stereo depth: disparity of a rectified pair ([demo/stereo_depth](stereo_depth/README.md)) |
+| bertsquad-12 (ONNX model zoo) | 256 tokens | extractive QA ([demo/bert_squad](bert_squad/README.md)) |
+| SmolLM2-135M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](chat/README.md)) |
+| SmolLM2-360M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](chat/README.md)) |
+| SmolVLM-256M-Instruct (Hugging Face safetensors) | one 512×512 image + text, context 1024 | chat about images ([demo/chat](chat/README.md)) |
+| stories15M ([nickypro/tinyllama-15M](https://huggingface.co/nickypro/tinyllama-15M): Karpathy's llama2.c model, Hugging Face safetensors) | text, up to 256 tokens of context | story writing: text completion ([demo/chat](chat/doc/STORIES.md)) |
+| Gemma-3-270M-it ([unsloth/gemma-3-270m-it](https://huggingface.co/unsloth/gemma-3-270m-it): Google's Gemma 3, Gemma terms of use; safetensors) | context 1024 | chat ([demo/chat](chat/README.md)) |
+| Piper en_US-lessac-medium ([rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) ONNX) | text, up to 4096 characters (espeak-ng phonemes) | text to speech ([demo/tts](tts/README.md), [demo/chat](chat/doc/TEXT_TO_SPEECH.md)) |
+| Moonshine base / tiny ([UsefulSensors/moonshine-base](https://huggingface.co/UsefulSensors/moonshine-base), safetensors) | 16 kHz audio, any length (parts of up to 24.6 s) | speech to text ([demo/asr](asr/scripts/), [demo/chat](chat/doc/SPEECH_TO_TEXT.md)) |
+| SmolVLA ([lerobot/smolvla_base](https://huggingface.co/lerobot/smolvla_base), safetensors) | 1–3 camera frames (any size), a task's tokens, the robot's state | robot actions: a chunk of 50 ([demo/vla](vla/README.md)) |
 
 ## Common workflow
 
