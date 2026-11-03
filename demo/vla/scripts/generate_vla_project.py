@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.join(REPO, "inference-scheduler"))
 
 from src.codegen.multi import MultiEntryGenerator       # noqa: E402
 from src.graph import OnnxGraph                         # noqa: E402
-from src.llama import load_safetensors                  # noqa: E402
+from src.checkpoint import load_safetensors             # noqa: E402
 from src.matmul_lowering import shared_weight_layouts    # noqa: E402
 from src.smolvla import SmolVLAConfig, SmolVLAFormats, SmolVLAFrontend   # noqa: E402
 

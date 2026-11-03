@@ -34,7 +34,6 @@ groups first) — TtsSum nodes the scheduler maps to VectorOP ADDs
 
 from __future__ import annotations
 
-import json
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -44,7 +43,8 @@ import onnx.helper as oh
 import onnx.numpy_helper as nph
 from onnx import TensorProto
 
-from . import numeric
+from .graph_builder import GraphBuilder, cheapest_qk_kw
+from .graph_builder import entry_info as _entry_info
 from .llm_nodes import LLM_DOMAIN
 
 FLOW_FRAMES, DEC_FRAMES, OUT_FRAMES = 256, 192, 128
@@ -159,7 +159,7 @@ def exponent_keys() -> List[str]:
     return keys
 
 
-class PiperChunkFrontend:
+class PiperChunkFrontend(GraphBuilder):
     """Builds the ``chunk`` entry.  ``W``: load_weights(); ``E``: the
     exponents (demo/tts/scripts/piper_study.py calibrate: tensor name ->
     f, conv inputs "<conv>#in"); ``vop_sums`` False builds the library before
@@ -168,6 +168,10 @@ class PiperChunkFrontend:
     as T = y0 + y1 into an int32 DMA tensor — emitted after the first prep of
     resblock 2 so that it runs under that resblock's first conv — then (T + y2) / 3;
     the same numbers (the sums are exact)."""
+
+    NODE_DOMAIN = LLM_DOMAIN
+    PRODUCER = "inference-scheduler/src/piper.py"
+    INFO_KEY = "axi.tts.entry"
 
     def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], name: str = "piper",
                  vop_sums: bool = True, split_avg: bool = False):
@@ -178,27 +182,14 @@ class PiperChunkFrontend:
         self.W, self.E, self.name, self.vop_sums = W, vop_exponents(E) if vop_sums else E, name, vop_sums
         self.split_avg = split_avg
 
-    # ---- builder helpers ------------------------------------------------ #
-    def _new(self):
-        self.nodes: List[onnx.NodeProto] = []
-        self.vi: Dict[str, onnx.ValueInfoProto] = {}
-        self.inits: List[onnx.TensorProto] = []
-        self.meta = numeric.empty()
-        self.n = 0
-
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, dma=None):
-        self.vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
-        if exp is not None:
-            self.meta["exp"][name] = int(exp)
-        if host is not None:
-            self.meta["host"][name] = host
-        if dma is not None:
-            self.meta["dma"][name] = dma
-        return name
+    # ---- builder helpers (GraphBuilder's and these) --------------------- #
+    def _new(self, ename=None):
+        super()._new(ename)
+        self._uids = 0
 
     def _uid(self, stem):
-        self.n += 1
-        return f"{stem}#{self.n}"
+        self._uids += 1
+        return f"{stem}#{self._uids}"
 
     def _prep(self, src, L_src, key, *, L, k=1, dil=1, taps=None, out_ch, base=0, ch0=0,
               nch=None, reverse=0, alpha=1.0, rate=1, frame_off=0, window=None):
@@ -214,10 +205,9 @@ class PiperChunkFrontend:
         nch = nch or 0
         y = self._t(self._uid(f"{key}#in"), [1, nch, rows, w0 + span], exp=self.E[f"{key}#in"])
         wlo, whi = window or (0, L_src)
-        self.nodes.append(oh.make_node(
-            "TtsPrep", [src, "lo", "hi"], [y], name=self._uid(f"{key}.prep"), domain=LLM_DOMAIN,
-            ch0=ch0, nch=nch, reverse=reverse, t0=o + hl, rows=rows, w0=w0, hl=hl, hr=span - hl,
-            rate=rate, frame_off=frame_off, alpha=repr(float(alpha)), wlo=wlo, whi=whi))
+        self._node("TtsPrep", [src, "lo", "hi"], [y], self._uid(f"{key}.prep"),
+                   ch0=ch0, nch=nch, reverse=reverse, t0=o + hl, rows=rows, w0=w0, hl=hl, hr=span - hl,
+                   rate=rate, frame_off=frame_off, alpha=repr(float(alpha)), wlo=wlo, whi=whi)
         return y, rows, w0, t_b - t_a
 
     def _conv(self, key, x, rows, w0, w, b, dil=1, out_key=None):
@@ -225,14 +215,13 @@ class PiperChunkFrontend:
         along the row; output [1][O][rows][w0] at exponent E[key]."""
         n_out, C, k = w.shape
         wn, bn = self._uid(f"{key}.w"), self._uid(f"{key}.b")
-        self.inits.append(nph.from_array(np.asarray(w, np.float32).reshape(n_out, C, 1, k), wn))
+        self._init(wn, np.asarray(w, np.float32).reshape(n_out, C, 1, k))
         ins = [x, wn]
         if b is not None:
-            self.inits.append(nph.from_array(np.asarray(b, np.float32), bn))
-            ins.append(bn)
+            ins.append(self._init(bn, b))
         y = self._t(self._uid(out_key or key), [1, n_out, rows, w0], exp=self.E[key])
-        self.nodes.append(oh.make_node("Conv", ins, [y], name=self._uid(key), kernel_shape=[1, k],
-                                       dilations=[1, dil], pads=[0, 0, 0, 0]))
+        self._node("Conv", ins, [y], self._uid(key), domain="", kernel_shape=[1, k], dilations=[1, dil],
+                   pads=[0, 0, 0, 0])
         return y
 
     def _sum(self, xs, ch0s, nch, L, key, div=1.0, shape=None, sbits=None):
@@ -240,8 +229,7 @@ class PiperChunkFrontend:
         attrs = dict(ch0s=list(ch0s), nch=nch, div=float(div))
         if sbits is not None:
             attrs["sbits"] = int(sbits)                # |the exact sum| < 2^sbits (the unit's SCALE)
-        self.nodes.append(oh.make_node("TtsSum", list(xs), [y], name=self._uid(f"{key}.sum"),
-                                       domain=LLM_DOMAIN, **attrs))
+        self._node("TtsSum", list(xs), [y], self._uid(f"{key}.sum"), **attrs)
         return y
 
     # ---- the entry --------------------------------------------------------- #
@@ -252,8 +240,8 @@ class PiperChunkFrontend:
         z = self._t("zp", [192, F], host="f32")
         self._t("lo", [1], TensorProto.INT32, host="i32")
         self._t("hi", [1], TensorProto.INT32, host="i32")
-        self.meta["test_fill"]["lo"] = 16
-        self.meta["test_fill"]["hi"] = F - 16
+        self._meta["test_fill"]["lo"] = 16
+        self._meta["test_fill"]["hi"] = F - 16
         for fi in (6, 4, 2, 0):
             p, e = f"flow.flows.{fi}", f"flow.flows.{fi}.enc"
             x0, r, w0, _ = self._prep(z, F, f"{p}.pre", L=F, out_ch=192, ch0=96, nch=96, reverse=1)
@@ -266,8 +254,7 @@ class PiperChunkFrontend:
                 o_rs = 384 if i < 3 else 192
                 r2, w2 = fold(F, o_rs)
                 acts = self._t(self._uid(f"{e}.rs.{i}#in"), [1, 192, r2, w2], exp=E[f"{e}.rs.{i}#in"])
-                self.nodes.append(oh.make_node("TtsGate", [xin], [acts], name=self._uid(f"{e}.gate.{i}"),
-                                               domain=LLM_DOMAIN))
+                self._node("TtsGate", [xin], [acts], self._uid(f"{e}.gate.{i}"))
                 rs = self._conv(f"{e}.rs.{i}", acts, r2, w2, W[f"{e}.res_skip_layers.{i}.weight"],
                                 W[f"{e}.res_skip_layers.{i}.bias"])
                 rs_all.append(rs)
@@ -279,8 +266,7 @@ class PiperChunkFrontend:
             wn = self._sum(rs_all, [192, 192, 192, 0], 192, F, f"{p}.post#in", shape=[1, 192, r3, w3])
             m = self._conv(f"{p}.post", wn, r3, w3, W[f"{p}.post.weight"], W[f"{p}.post.bias"])
             zn = self._t(self._uid(f"{p}.z"), [192, F], host="f32")
-            self.nodes.append(oh.make_node("TtsFlowOut", [z, m, "lo", "hi"], [zn],
-                                           name=self._uid(f"{p}.out"), domain=LLM_DOMAIN))
+            self._node("TtsFlowOut", [z, m, "lo", "hi"], [zn], self._uid(f"{p}.out"))
             z = zn
         # decoder on the central DEC_FRAMES frames
         L = DEC_FRAMES
@@ -296,8 +282,7 @@ class PiperChunkFrontend:
             yp = self._conv(f"dec.up{i}", a, r, w0, w3, b3)
             L, rate = L * s, rate * s
             xu = self._t(self._uid(f"dec.up{i}.x"), [n_out, L], exp=E[f"dec.up{i}"])
-            self.nodes.append(oh.make_node("TtsInterleave", [yp], [xu], name=self._uid(f"dec.up{i}.il"),
-                                           domain=LLM_DOMAIN, s=s))
+            self._node("TtsInterleave", [yp], [xu], self._uid(f"dec.up{i}.il"), s=s)
             ys, t_avg = [], None
             for j in range(3):
                 rb = f"dec.rb{i}{j}"
@@ -317,9 +302,8 @@ class PiperChunkFrontend:
                             # T = y0 + y1, exact in int32, issued under resblock 2's first conv
                             t_avg = self._t(self._uid(f"dec.st{i}.t"), [n_out, L],
                                             exp=max(E[f"dec.rb{i}0.y1"], E[f"dec.rb{i}1.y1"]), dma="i32")
-                            self.nodes.append(oh.make_node("TtsSum", ys[:2], [t_avg],
-                                                           name=self._uid(f"dec.st{i}.t.sum"), domain=LLM_DOMAIN,
-                                                           ch0s=[0, 0], nch=n_out, div=1.0))
+                            self._node("TtsSum", ys[:2], [t_avg], self._uid(f"dec.st{i}.t.sum"),
+                                       ch0s=[0, 0], nch=n_out, div=1.0)
                         parts.append(self._conv(f"{rb}.c{c}", a, r, w0, wt[:, :, ta:tb],
                                                 bt if ta == 0 else None, dil=d))
                     if self.vop_sums and len(parts) > 1:      # the tap groups first (saturated)
@@ -337,31 +321,19 @@ class PiperChunkFrontend:
                                  frame_off=DEC_OFF)
         yo = self._conv("dec.post", a, r, w0, W["dec.conv_post.weight"], None)
         pcm = self._t("pcm", [L], TensorProto.INT16, exp=0, host="i16")
-        self.nodes.append(oh.make_node("TtsPcm", [yo], [pcm], name="dec.pcm", domain=LLM_DOMAIN))
+        self._node("TtsPcm", [yo], [pcm], "dec.pcm")
         return self._model(["zp", "lo", "hi"], ["pcm"])
 
     def _model(self, inputs, outputs):
-        g = oh.make_graph(self.nodes, f"{self.name}_chunk", [self.vi[n] for n in inputs],
-                          [self.vi[n] for n in outputs], initializer=self.inits,
-                          value_info=[v for n, v in self.vi.items() if n not in inputs and n not in outputs])
-        m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17), oh.make_opsetid(LLM_DOMAIN, 1)],
-                          producer_name="inference-scheduler/src/piper.py")
-        m.ir_version = 8
-        p = m.metadata_props.add()
-        p.key, p.value = numeric.METADATA_KEY, numeric.to_metadata(self.meta)
-        p = m.metadata_props.add()
-        p.key = "axi.tts.entry"
-        p.value = json.dumps({"entry": "chunk", "model": self.name, "flow_frames": FLOW_FRAMES,
-                              "dec_frames": DEC_FRAMES, "out_frames": OUT_FRAMES, "dec_off": DEC_OFF,
-                              "hop": HOP, "sample_rate": 22050})
-        return m
+        return self._make_model(f"{self.name}_chunk", inputs, outputs,
+                                {"entry": "chunk", "model": self.name, "flow_frames": FLOW_FRAMES,
+                                 "dec_frames": DEC_FRAMES, "out_frames": OUT_FRAMES, "dec_off": DEC_OFF,
+                                 "hop": HOP, "sample_rate": 22050})
 
 
 def entry_info(model: onnx.ModelProto) -> Optional[dict]:
-    for p in model.metadata_props:
-        if p.key == "axi.tts.entry":
-            return json.loads(p.value)
-    return None
+    """A Piper entry's info record (``axi.tts.entry``)."""
+    return _entry_info(model, PiperChunkFrontend.INFO_KEY)
 
 
 # ---- the text encoder: encode_<T> entries ------------------------------------ #
@@ -402,7 +374,7 @@ def encoder_exponent_keys() -> List[str]:
     return keys
 
 
-class PiperEncoderFrontend:
+class PiperEncoderFrontend(GraphBuilder):
     """Builds the ``encode_<T>`` entry: inputs ids [T] (int32, padded) and n
     [1] (the valid ids); outputs x [T][192] and stats [T][384] (float32 host,
     rows >= n zero): the text encoder's output and its projection (m_p,
@@ -410,6 +382,10 @@ class PiperEncoderFrontend:
     softmax on VectorOPKernel's unit (doc/plans/SOFTMAX_PLAN.md §5) — the host
     adds the relative-key band (TtsAttnRelAdd), the unit takes the softmax;
     the specification is piper_vits.encoder_forward(vsmx_unit=True)."""
+
+    NODE_DOMAIN = LLM_DOMAIN
+    PRODUCER = "inference-scheduler/src/piper.py"
+    INFO_KEY = "axi.tts.entry"
 
     def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], T: int, name: str = "piper",
                  vsmx: bool = False, rowops: bool = False, rel_kernel: Optional[bool] = None):
@@ -436,44 +412,10 @@ class PiperEncoderFrontend:
 
     def choose_qk_kw(self) -> int:
         """The q image's kernel width for q.K^T: the cheapest by the conv cost model."""
-        from .cost_model import conv_cycles
-        best = None
-        for kw in (1, 2, 4):
-            if ENC_HD % (16 * kw):
-                continue
-            for ow in [d for d in range(8, 65) if self.T % d == 0] or [self.T]:
-                cyc = conv_cycles(in_ch=ENC_HD // kw, out_ch=self.T, in_h=self.T // ow, in_w=kw * ow,
-                                  oh=self.T // ow, ow=ow, kh=1, kw=kw, sw=kw)["total"]
-                if best is None or cyc < best[0]:
-                    best = (cyc, kw)
-        return best[1]
+        return cheapest_qk_kw(ENC_HD, self.T, self.T)
 
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False, dma=None):
-        self.vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
-        if exp is not None:
-            self.meta["exp"][name] = int(exp)
-        if host is not None:
-            self.meta["host"][name] = host
-        if dma is not None:
-            self.meta["dma"][name] = dma
-        if state:
-            self.meta["state"].append(name)
-        return name
-
-    def _init(self, name, arr):
-        if name not in self.init_names:
-            self.init_names.add(name)
-            self.inits.append(nph.from_array(np.asarray(arr, np.float32), name))
-        return name
-
-    def _node(self, op, ins, outs, name, domain=LLM_DOMAIN, **attrs):
-        self.nodes.append(oh.make_node(op, ins, outs, name=name, domain=domain, **attrs))
-
-    def _matmul(self, x, wkey, y, cols, exp):
-        wname = self._init(f"w.enc.{wkey}", self.EW[wkey])
-        self._t(y, [self.T, cols], exp=exp)
-        self._node("MatMul", [x, wname], [y], y, domain="")
-        return y
+    def _linear(self, x, wkey, y, exp):
+        return self._matmul(x, f"w.enc.{wkey}", self.EW[wkey], self.T, y, exp, y)
 
     def _resnorm(self, x, fx, y, fy, out, f_out, bias, gamma, beta, name, D):
         """LayerNorm(x + (y + bias)) -> out: the host op TtsResNorm, or with rowops the
@@ -500,19 +442,18 @@ class PiperEncoderFrontend:
     def entry(self) -> onnx.ModelProto:
         T, E, EW, D, H, HD, Wn = self.T, self.E, self.EW, ENC_D, ENC_H, ENC_HD, ENC_WIN
         p = f"enc{T}"
-        self.nodes, self.vi, self.inits, self.init_names = [], {}, [], set()
-        self.meta = numeric.empty()
+        self._new(p)
         ids = self._t(f"{p}.ids", [T], TensorProto.INT32, host="i32")
         self.n = self._t(f"{p}.n", [1], TensorProto.INT32, host="i32")
-        self.meta["test_fill"][self.n] = max(1, T - 5)          # the generated test: padding rows too
+        self._meta["test_fill"][self.n] = max(1, T - 5)          # the generated test: padding rows too
         x = self._t(f"{p}.x0", [T, D], exp=E["enc.x0"])
         self._node("TtsEmbed", [ids, self._init("v.enc.emb", EW["emb"]), self.n], [x], f"{p}.embed",
                    scale=repr(math.sqrt(D)))
         CK = T + REL_ROWS if self.rel else T                 # the K cache: + the relative-key rows
         kc = self._t(f"{p}.kc", [CK, D], exp=0, state=True)
         vc = self._t(f"{p}.vc", [T, D], exp=0, state=True)
-        self.meta["layout"][kc] = [H, HD]
-        self.meta["layout"][vc] = [H, HD] + ([self.pv_kw] if self.pv_kw > 1 else [])
+        self._meta["layout"][kc] = [H, HD]
+        self._meta["layout"][vc] = [H, HD] + ([self.pv_kw] if self.pv_kw > 1 else [])
         self._init(kc, np.zeros((CK, D), np.float32))
         self._init(vc, np.zeros((T, D), np.float32))
         band = []
@@ -534,9 +475,9 @@ class PiperEncoderFrontend:
         for i in range(ENC_LAYERS):
             e, te = f"enc.l{i}", f"{p}.l{i}"
             xin = self._rowprep(x, f"{te}.xin", D, E[f"{e}.xin"])
-            q0 = self._matmul(xin, f"l{i}.wq", f"{te}.q0", D, E[f"{e}.q0"])
-            k0 = self._matmul(xin, f"l{i}.wk", f"{te}.k0", D, E[f"{e}.k0"])
-            v0 = self._matmul(xin, f"l{i}.wv", f"{te}.v0", D, E[f"{e}.v0"])
+            q0 = self._linear(xin, f"l{i}.wq", f"{te}.q0", E[f"{e}.q0"])
+            k0 = self._linear(xin, f"l{i}.wk", f"{te}.k0", E[f"{e}.k0"])
+            v0 = self._linear(xin, f"l{i}.wv", f"{te}.v0", E[f"{e}.v0"])
             qx = self._t(f"{te}.qx", [H, HD, T], exp=0)
             bq = self._init(f"v.enc.l{i}.bq", EW[f"l{i}.bq"])
             rel_extra = []
@@ -575,34 +516,24 @@ class PiperEncoderFrontend:
             self._node("TtsAttnMerge", o + pr + [self._init(f"v.enc.l{i}.ev", EW[f"l{i}.ev"].reshape(-1)), self.n],
                        [att], f"{te}.attn_merge", num_heads=H, head_dim=HD, window=Wn,
                        o_exp=[E[f"{e}.o"]] * H, p_exp=[fp])
-            y = self._matmul(att, f"l{i}.wo", f"{te}.y", D, E[f"{e}.y"])
+            y = self._linear(att, f"l{i}.wo", f"{te}.y", E[f"{e}.y"])
             x1 = self._resnorm(x, fx, y, E[f"{e}.y"], f"{te}.x1", E[f"{e}.x1"], f"l{i}.bo", f"l{i}.g1",
                                f"l{i}.be1", f"{te}.norm1", D)
             c1 = self._rowprep(x1, f"{te}.c1", D, E[f"{e}.c1"], taps=3)
-            f1 = self._matmul(c1, f"l{i}.w1", f"{te}.f1", EW[f"l{i}.w1"].shape[1], E[f"{e}.f1"])
+            f1 = self._linear(c1, f"l{i}.w1", f"{te}.f1", E[f"{e}.f1"])
             h = self._rowprep(f1, f"{te}.h", EW[f"l{i}.w1"].shape[1], E[f"{e}.h"], taps=3, bias=f"l{i}.b1",
                               relu=1)
-            f2 = self._matmul(h, f"l{i}.w2", f"{te}.f2", D, E[f"{e}.f2"])
+            f2 = self._linear(h, f"l{i}.w2", f"{te}.f2", E[f"{e}.f2"])
             x = self._resnorm(x1, E[f"{e}.x1"], f2, E[f"{e}.f2"], f"{te}.x2", E[f"{e}.x2"], f"l{i}.b2",
                               f"l{i}.g2", f"l{i}.be2", f"{te}.norm2", D)
             fx = E[f"{e}.x2"]
         sti = self._rowprep(x, f"{p}.st_in", D, E["enc.st#in"])
-        st = self._matmul(sti, "wp", f"{p}.st", 2 * D, E["enc.st"])
+        st = self._linear(sti, "wp", f"{p}.st", E["enc.st"])
         xo = self._t(f"{p}.x", [T, D], host="f32")
         so = self._t(f"{p}.stats", [T, 2 * D], host="f32")
         self._node("TtsEncOut", [x, self.n], [xo], f"{p}.x_out")
         self._node("TtsEncOut", [st, self.n, self._init("v.enc.bp", EW["bp"])], [so], f"{p}.stats_out")
-        g = oh.make_graph(self.nodes, f"{self.name}_encode_{T}", [self.vi[ids], self.vi[self.n]],
-                          [self.vi[xo], self.vi[so]], initializer=self.inits,
-                          value_info=[v for k, v in self.vi.items() if k not in (ids, self.n, xo, so)])
-        m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17), oh.make_opsetid(LLM_DOMAIN, 1)],
-                          producer_name="inference-scheduler/src/piper.py")
-        m.ir_version = 8
-        md = m.metadata_props.add()
-        md.key, md.value = numeric.METADATA_KEY, numeric.to_metadata(self.meta)
-        md = m.metadata_props.add()
-        md.key = "axi.tts.entry"
-        md.value = json.dumps({"entry": f"encode_{T}", "model": self.name, "rows": T, "hidden": D,
-                               "heads": H, "head_dim": HD, "qk_kw": kw, "pv_kw": self.pv_kw,
-                               "vsmx": self.vsmx, "rel": self.rel})
-        return m
+        return self._make_model(f"{self.name}_encode_{T}", [ids, self.n], [xo, so],
+                                {"entry": f"encode_{T}", "model": self.name, "rows": T, "hidden": D,
+                                 "heads": H, "head_dim": HD, "qk_kw": kw, "pv_kw": self.pv_kw,
+                                 "vsmx": self.vsmx, "rel": self.rel})

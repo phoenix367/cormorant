@@ -174,7 +174,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1920 tests, none skipped once demo/asr/scripts/asr_study.py fetch has run — test_moonshine.py's
+# Run all tests (1927 tests, none skipped once demo/asr/scripts/asr_study.py fetch has run — test_moonshine.py's
 # TestMoonshineTiny needs its checkpoint; test_bert_base.py downloads bertsquad-12 — 435 MB — into
 # demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
@@ -199,6 +199,7 @@ Key source files:
 - **`inference-scheduler/src/bank_phase.py`** — DRAM bank phases of the DMA pool slots: a binary VectorOP's a, b, c start in different DDR banks (byte address bits 14–15; ~20 % faster memory-bound VectorOP calls on the KV260, `--bank-phase`, `doc/plans/PS_PORTS_PLAN.md` §11)
 - **`inference-scheduler/src/numeric.py`** — `axi.numeric` metadata: per-tensor / per-channel power-of-two exponents (constant MatMul weights at the rank-1 exponent `f_w = f_out + 8 − f_in`), host-memory tensors (f32 / i32 / i16), persistent states
 - **`inference-scheduler/src/llama.py`** / **`src/llm_nodes.py`** — Llama frontend and the `axi.llm` host ops (numpy reference + C helpers)
+- **`inference-scheduler/src/graph_builder.py`** — what the model frontends (Llama, ViT, SmolVLA, Moonshine, Piper) share: `GraphBuilder` (an entry graph's tensors and their `axi.numeric` metadata, initializers, nodes, the ModelProto with its info record), `ExponentTable` (the calibrated formats; a missing tensor class is an error), the FPGA attention's exponents, q-image kernel width and per-group call order (`doc/plans/CHAT_PLAN.md` §30)
 - **`inference-scheduler/src/vit.py`** / **`src/vit_nodes.py`** — vision-encoder frontend (`VitFrontend`, the `vision` entry) and its `Vit*` host ops
 - **`inference-scheduler/src/moonshine.py`** / **`src/asr_nodes.py`** — Moonshine speech-to-text frontend (`MoonshineFrontend`: checkpoint + `demo/asr/moonshine-<size>_opt_formats.json` → `encode_<T>` / `decode` entries) and its `Asr*` ops; `demo/asr/` holds the study (`scripts/asr_study.py`), the specification (`scripts/moonshine_q.py`) and the library (`scripts/generate_asr_project.py` → `libmoonshine_<size>.so` over `src/asr_api.c`; the host-emulation gate `scripts/asr_host_emu.py`, the board gate `scripts/asr_board.py`)
 - **`inference-scheduler/src/smolvla.py`** / **`src/vla_nodes.py`** — SmolVLA vision-language-action frontend (`SmolVLAFrontend`: the policy's and SmolVLM2's config.json + the checkpoint + `demo/vla/smolvla_base_pow2+p12+vgelu+vsmx+rowops_formats.json` → `vision` / `image_<c>` / `prefix_<C>` / `expert` entries) and its `Vla*` ops; `demo/vla/` holds the study (`scripts/vla_study.py`), the specification (`scripts/smolvla_q.py`) and the library (`scripts/generate_vla_project.py` → `libsmolvla.so` over `src/vla_api.c`, `vla_lib.py` its ctypes wrapper; the host-emulation gate `scripts/vla_host_emu.py`, the board gate `scripts/vla_board.py`)

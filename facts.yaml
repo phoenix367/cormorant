@@ -1999,7 +1999,7 @@ facts:
             transform: 'len(v)'}
       host: {py: "re:len(findall(r'\\] TtsSum\\([^\\n]*host CPU, no hardware call', open('../demo/tts/build/piper_project/src/inference.c').read()))",
              cwd: inference-scheduler}                # 0 since RPU_PLAN A3a.4: a count, not a match
-      stage_exp: {py: "src.piper:' / '.join(str(vop_exponents(json.load(open('../demo/tts/assets/piper-lessac-medium/exponents.json'))['exponents'])[f'dec.up{i}']) for i in range(3))",
+      stage_exp: {py: "src.piper:' / '.join(str(vop_exponents(__import__('json').load(open('../demo/tts/assets/piper-lessac-medium/exponents.json'))['exponents'])[f'dec.up{i}']) for i in range(3))",
                   cwd: inference-scheduler}
   fix: report
   mentions:

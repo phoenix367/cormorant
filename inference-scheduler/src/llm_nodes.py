@@ -553,6 +553,13 @@ class LlmResAddNode(LlmNode):
 # LlmRMSNorm                                                           #
 # ------------------------------------------------------------------ #
 
+def norm_eps(a: dict) -> float:
+    """An LlmRMSNorm's eps: ``axi_eps`` (the config's value as text), else ONNX's
+    ``epsilon``, else 1e-5."""
+    v = a.get("axi_eps", a.get("epsilon", 1e-5))
+    return float(v.decode() if isinstance(v, bytes) else v)
+
+
 @dataclass
 class LlmRMSNormNode(LlmNode):
     """y = (h * r) * gamma, r = 1 / sqrt(sum(h^2) / n + eps) per row;
@@ -569,9 +576,7 @@ class LlmRMSNormNode(LlmNode):
         n = int(h.shape[-1])
         g = _const_array(ctx, tensors, node.input[1], node, "gamma").astype(np.float32).reshape(-1)
         _require(g.size == n, node, "gamma size")
-        a = _attrs(node)
-        eps = float(a["axi_eps"].decode() if isinstance(a.get("axi_eps"), bytes)
-                    else a.get("axi_eps", a.get("epsilon", 1e-5)))
+        eps = norm_eps(_attrs(node))
         sn = cls(onnx_node=node, inputs=[h], output=y, index=index, align_elems=align_elems,
                  rows=h.numel // n, n=n, eps=eps, gamma=g.copy(),
                  F=ctx.frac_bits)

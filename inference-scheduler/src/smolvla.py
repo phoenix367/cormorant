@@ -57,20 +57,17 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 import onnx
-import onnx.helper as oh
 from onnx import TensorProto
 
-from . import numeric
-from .llama import LlamaConfig, graph_with_initializers, rope_tables
+from . import rope
+from .graph_builder import RES_BITS, ExponentTable, GraphBuilder, pv_exp, score_exp
 from .llm_nodes import LLM_DOMAIN
 from .vit import VisionFormats, VitConfig, VitFrontend
 
-F = 8                                   # the kernels' output shift
-RES_BITS = 15                           # the int32 residual's exponent
 KEY_Q = 64                              # the attention's key quantum (16 x the V interleave 4)
 PV_KW = 4                               # the V caches' interleave
 ROPE_THETA = 10000.0                    # lerobot apply_rope's max_wavelength
@@ -177,10 +174,10 @@ class SmolVLAConfig:
         """C: the longest prefix plus the action rows, rounded up to KEY_Q."""
         return _roundup(self.cameras * self.img + self.tok_max + 1 + self.chunk, KEY_Q)
 
-    def llama(self) -> LlamaConfig:
+    @property
+    def rope_spec(self) -> rope.RopeSpec:
         """The RoPE tables' parameters (head dim, theta 10000)."""
-        return LlamaConfig(L=self.L, D=self.D, H=self.H, KV=self.KV, HD=self.HD, FF=self.F, V=self.V,
-                           eps=self.eps, theta=ROPE_THETA)
+        return rope.RopeSpec(self.HD, ROPE_THETA)
 
 
 class SmolVLAFormats:
@@ -189,9 +186,9 @@ class SmolVLAFormats:
 
     def __init__(self, d: dict, cfg: SmolVLAConfig):
         self.cfg = cfg
-        self.exp = {p: dict(v) for p, v in d["exponents"].items()}
         self.policy = d.get("policy", "")
-        self.vision = VisionFormats({"exponents": self.exp["vision"], "policy": self.policy},
+        self.parts = {p: ExponentTable({"exponents": v, "policy": self.policy}) for p, v in d["exponents"].items()}
+        self.vision = VisionFormats({"exponents": d["exponents"]["vision"], "policy": self.policy},
                                     VitConfig.from_dict(cfg.vision))
 
     @classmethod
@@ -201,19 +198,7 @@ class SmolVLAFormats:
 
     def get(self, cls_: str, part: str, layer: int, n: int) -> np.ndarray:
         """A scalar broadcast, a per-head vector repeated over its heads' channels."""
-        v = np.asarray(self.exp[part].get(f"{cls_}@{layer}", F), np.int64).reshape(-1)
-        if v.size == 1:
-            return np.full(n, int(v[0]), np.int64)
-        if v.size == n:
-            return v.copy()
-        if n % v.size:
-            raise ValueError(f"formats: {part} {cls_}@{layer} has {v.size} values, {n} wanted")
-        return np.repeat(v, n // v.size)
-
-
-def _compact(e):
-    e = np.asarray(e, np.int64).reshape(-1)
-    return int(e[0]) if (e == e[0]).all() else [int(v) for v in e]
+        return self.parts[part].lookup(f"{cls_}@{layer}", n)
 
 
 def time_embedding(t: float, dim: int, min_period: float, max_period: float) -> np.ndarray:
@@ -254,8 +239,11 @@ def vision_weights(W: Dict[str, np.ndarray], cfg: SmolVLAConfig) -> Dict[str, np
     return out
 
 
-class SmolVLAFrontend:
+class SmolVLAFrontend(GraphBuilder):
     """Builds the entries.  ``weights``: the checkpoint's tensors by name (float32)."""
+
+    NODE_DOMAIN = LLM_DOMAIN
+    PRODUCER = "inference-scheduler/src/smolvla.py"
 
     def __init__(self, cfg: SmolVLAConfig, weights: Dict[str, np.ndarray], formats: SmolVLAFormats,
                  name: str = "smolvla"):
@@ -266,7 +254,7 @@ class SmolVLAFrontend:
             raise ValueError("SmolVLA needs VectorOPKernel's softmax and activation units")
         self.cfg, self.W, self.fmt, self.name = cfg, weights, formats, name
         C = cfg.cache_rows
-        cos, sin = rope_tables(cfg.llama(), C)
+        cos, sin = rope.half_tables(cfg.rope_spec, C)
         self._cos, self._sin = cos, sin
         self.suffix = suffix_weights(weights, cfg)
         # the expert's self layers write into the VLM's caches: one set of exponents
@@ -277,47 +265,15 @@ class SmolVLAFrontend:
                     if not np.array_equal(formats.get(c_, "text", li, n), formats.get(c_, "expert", li, n)):
                         raise ValueError(f"formats: {c_}@{li} of the VLM and the expert differ (shared cache)")
             for part, key in (("text", "o"), ("text", "d"), ("expert", "o"), ("expert", "d")):
+                if part == "text" and li == cfg.L - 1:
+                    continue                # the prefix's last layer ends at its K / V (no o / d)
                 fd = formats.get(key, part, li, cfg.D if part == "text" else cfg.De)
-                if (fd > RES_BITS).any() and not (part == "text" and key in ("o", "d") and li == cfg.L - 1):
+                if (fd > RES_BITS).any():
                     raise ValueError(f"formats: the {part} {key} exponents of layer {li} exceed 2^-{RES_BITS}")
 
-    # ---- builder helpers (src/llama.py's conventions) ------------------------ #
-    def _new(self, ename):
-        self._nodes: List[onnx.NodeProto] = []
-        self._vi: Dict[str, onnx.ValueInfoProto] = {}
-        self._inits: Dict[str, np.ndarray] = {}
-        self._meta = numeric.empty()
-        self._e = ename
-
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False, dma=None):
-        if name not in self._vi:
-            self._vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
-        if dma is not None:
-            self._meta["dma"][name] = dma
-        if exp is not None:
-            self._meta["exp"][name] = _compact(exp)
-        if host is not None:
-            self._meta["host"][name] = host
-        if state and name not in self._meta["state"]:
-            self._meta["state"].append(name)
-        return name
-
-    def _init(self, name, arr):
-        if name not in self._inits:
-            self._inits[name] = np.asarray(arr, np.float32)
-        return name
-
-    def _node(self, op, ins, outs, name, domain=LLM_DOMAIN, **attrs):
-        self._nodes.append(oh.make_node(op, ins, outs, name=name, domain=domain, **attrs))
-
-    def _matmul(self, x, wname, W, T, y, exp, name):
-        self._init(wname, W)
-        self._t(y, [T, W.shape[1]], exp=exp)
-        self._node("MatMul", [x, wname], [y], name, domain="")
-        return y
-
+    # ---- builder helpers (GraphBuilder's and these) ---------------------------- #
     def _res(self, name, T, D):
-        return self._t(name, [T, D], exp=RES_BITS, dma="i32")
+        return self._residual(name, T, D)
 
     def _rms(self, h, gname, T, D, out, exp, name):
         g = self._init(f"g.{gname}", self.W[gname])
@@ -369,9 +325,8 @@ class SmolVLAFrontend:
         """Per KV group: q.K^T, the unit's softmax, P.V (+ the state row); -> pv."""
         c, fm = self.cfg, self.fmt
         G, KV, HD, H = c.H // c.KV, c.KV, c.HD, c.H
-        grp = np.arange(H) // G
         fq, fk = fm.get("q", part, li, H), fm.get("k", part, li, KV)
-        fs, fp = fq + fk[grp] - F, fm.get("p", part, li, H)
+        fs, fp = score_exp(fq, fk, KV), fm.get("p", part, li, H)
         common = dict(num_heads=H, num_kv_heads=KV, head_dim=HD, key_quantum=KEY_Q)
         o, st = [], []
         for g in range(KV):
@@ -391,7 +346,7 @@ class SmolVLAFrontend:
                            s_exp=[int(v) for v in fs[hs]], p_exp=[int(v) for v in fp[hs]], **common)
                 st.append(st_)
         fvc = fm.get("vc", part, li, KV * HD)
-        pv = self._t(f"{el}.pv", [T, H * HD], exp=(fp[:, None] + fvc.reshape(KV, HD)[grp] - F).reshape(-1))
+        pv = self._t(f"{el}.pv", [T, H * HD], exp=pv_exp(fp, fvc, KV, HD))
         if state_row:
             self._node("VlaAttnMerge", o + st + [n], [pv], f"{el}.attn_merge", num_heads=H, num_kv_heads=KV,
                        head_dim=HD)
@@ -592,25 +547,12 @@ class SmolVLAFrontend:
         return out
 
     def _model(self, ename, inputs, outputs, info):
-        g = graph_with_initializers(
-            self._nodes, f"{self.name}_{ename}",
-            [self._vi[n] for n in inputs], [self._vi[n] for n in outputs], self._inits,
-            value_info=[vi for n, vi in self._vi.items() if n not in inputs and n not in outputs])
-        self._inits = {}
-        m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17), oh.make_opsetid(LLM_DOMAIN, 1)],
-                          producer_name="inference-scheduler/src/smolvla.py")
-        m.ir_version = 8
-        p = m.metadata_props.add()
-        p.key = numeric.METADATA_KEY
-        p.value = numeric.to_metadata(self._meta)
-        p = m.metadata_props.add()
-        p.key = "axi.llm.entry"
         c = self.cfg
-        p.value = json.dumps(dict(info, model=self.name, layers=c.L, hidden=c.D, expert_hidden=c.De, heads=c.H,
-                                  kv_heads=c.KV, head_dim=c.HD, chunk=c.chunk, steps=c.steps,
-                                  max_action=c.max_action, max_state=c.max_state, tok_max=c.tok_max,
-                                  image_tokens=c.img, cache_rows=c.cache_rows))
-        return m
+        return self._make_model(f"{self.name}_{ename}", inputs, outputs,
+                                dict(info, model=self.name, layers=c.L, hidden=c.D, expert_hidden=c.De, heads=c.H,
+                                     kv_heads=c.KV, head_dim=c.HD, chunk=c.chunk, steps=c.steps,
+                                     max_action=c.max_action, max_state=c.max_state, tok_max=c.tok_max,
+                                     image_tokens=c.img, cache_rows=c.cache_rows))
 
 
 __all__ = ("SmolVLAConfig", "SmolVLAFormats", "SmolVLAFrontend", "suffix_weights", "vision_weights",

@@ -574,7 +574,7 @@ def from_llm_resadd(node, tensors, index, align_elems, ctx: HostContext):
 def from_llm_rmsnorm(node, tensors, index, align_elems, ctx: HostContext):
     """LlmRMSNorm: RMSNormRoNode when h is the int32 DMA residual, else the host op."""
     from .host_nodes import _attrs
-    from .llm_nodes import LlmRMSNormNode, _const_array
+    from .llm_nodes import LlmRMSNormNode, _const_array, norm_eps
     h = tensors.get(node.input[0])
     if h is None or h.dma != "i32":
         return LlmRMSNormNode.from_onnx_node(node, tensors, index, align_elems, ctx)
@@ -588,9 +588,7 @@ def from_llm_rmsnorm(node, tensors, index, align_elems, ctx: HostContext):
              "output: an int16 DMA tensor of h's shape")
     gamma = _const_array(ctx, tensors, node.input[1], node, "gamma").astype(np.float64).reshape(-1)
     _require(gamma.size == n, node, "gamma size")
-    a = _attrs(node)
-    eps = float(a["axi_eps"].decode() if isinstance(a.get("axi_eps"), bytes)
-                else a.get("axi_eps", a.get("epsilon", 1e-5)))
+    eps = norm_eps(_attrs(node))
     G, g, _bq, E = rs.norm_params(gamma, n, eps, int(fr[0]), rms=True)
     fo = _exps(y, F)
     sh_c = rs.P1_BITS + g - fo

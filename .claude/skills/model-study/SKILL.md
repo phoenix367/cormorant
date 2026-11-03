@@ -181,6 +181,14 @@ headroom, separate calibration data), `costs`.  Emulate the partition the
 scheduler will generate — the study script becomes the spec its frontend
 must match bit for bit.  Deterministic: greedy only, fixed data.
 
+The frontend that follows a GO is a `src/<model>.py` class on
+`src/graph_builder.py`'s `GraphBuilder` (tensors and their `axi.numeric`
+metadata, initializers, nodes, the entry's ModelProto), its formats an
+`ExponentTable` (a class the calibration did not write is an error), its
+FPGA attention from `score_exp` / `pv_exp` / `cheapest_qk_kw` /
+`group_order` — `src/moonshine.py` and `src/smolvla.py` are the closest
+templates; `src/rope.py` covers partial and interleaved rotations.
+
 ## 6. The write-up
 
 A new section in the plan the model belongs to (`doc/plans/CHAT_PLAN.md` for

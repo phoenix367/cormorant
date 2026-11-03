@@ -13,8 +13,10 @@ The datapath rotates head dims (j, j + HD/2) of every head: rotate-half over
 the whole head.  A model that rotates only its first ``rot`` dims (partial
 rotation: rotate-half within them, the rest passed through) is mapped onto it
 by permuting the head dims of q and k (``perm``: the same permutation on both
-leaves q·k unchanged) and giving the pass-through pairs cos 1, sin 0 — as
-src/moonshine.py does for Moonshine's interleaved partial rotation.  An
+leaves q·k unchanged) and giving the pass-through pairs cos 1, sin 0; an
+interleaved rotation (pairs (2j, 2j + 1), GPT-J style) likewise — src/moonshine.py
+maps Moonshine's interleaved partial rotation so, its heads padded to a
+multiple of 16 with more pass-through pairs (``half_tables`` of a wider head).  An
 attention factor (yarn, longrope) scales cos and sin of the rotated dims,
 i.e. the rotated part of q·k by factor²: llm_weights folds factor² into
 those rows of W_q, so the tables keep |cos|, |sin| <= 1 (the row-ops unit's
@@ -39,6 +41,7 @@ class RopeSpec:
     rot: int = 0                     # rotated dims per head (0: hd)
     scaling: Optional[dict] = field(default=None, compare=False)   # rope_type + its parameters
     max_pos: int = 0                 # max_position_embeddings
+    interleaved: bool = False        # rotated pairs (2j, 2j + 1), not (j, j + rot/2)
 
     @property
     def dims(self) -> int:
@@ -109,14 +112,18 @@ def attention_factor(spec: RopeSpec) -> float:
 
 
 def perm(spec: RopeSpec) -> np.ndarray:
-    """[hd] head-dim order of q / k rows: rotated pair j (dims j, j + rot/2) at
-    (j, j + hd/2), the pass-through dims (rot..hd) in the remaining places
-    (the identity for a full rotation)."""
+    """[hd] head-dim order of q / k rows: rotated pair j (dims j, j + rot/2, or
+    2j, 2j + 1 when interleaved) at (j, j + hd/2), the pass-through dims
+    (rot..hd) in the remaining places (the identity for a full rotate-half)."""
     hd, rot = spec.hd, spec.dims
     half, npair = hd // 2, rot // 2
     order = np.empty(hd, np.int64)
-    order[:npair] = np.arange(npair)
-    order[half:half + npair] = np.arange(npair, rot)
+    if spec.interleaved:
+        order[:npair] = np.arange(0, rot, 2)
+        order[half:half + npair] = np.arange(1, rot, 2)
+    else:
+        order[:npair] = np.arange(npair)
+        order[half:half + npair] = np.arange(npair, rot)
     rest = np.arange(rot, hd)
     order[npair:half] = rest[:half - npair]
     order[half + npair:] = rest[half - npair:]

@@ -292,7 +292,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1920 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1927 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -327,6 +327,10 @@ inference_scheduler.py          CLI, argument parsing
     │                           runtime key count, static for the vision encoder)
     ├── numeric.py              axi.numeric metadata: power-of-two exponents,
     │                           host tensors, states; rank-1 weight encoding
+    ├── graph_builder.py        what the frontends share: the entry graph's
+    │                           tensors / metadata / initializers / nodes, the
+    │                           formats lookup, the FPGA attention's exponents,
+    │                           q-image kernel width and per-group call order
     ├── llama.py                Llama frontend: config + safetensors +
     │                           formats -> fixed-shape entry graphs
     ├── vit_nodes.py            axi.llm ops of a vision encoder (LayerNorm,
@@ -1137,7 +1141,10 @@ a regeneration); a class the formats lack is an error, not a default.
 Mistral, Granite and Phi-3 checkpoints, RoPE scaling and partial rotation
 are read through `src/llm_weights.py` / `src/rope.py`, which fold their
 extras into the plain block for the frontend and the study alike
-(doc/plans/CHAT_PLAN.md §29).  Entries (T rows, C = context incl. the sink):
+(doc/plans/CHAT_PLAN.md §29).  The graph plumbing — tensors with their
+`axi.numeric` metadata, initializers, nodes, the entry's ModelProto — is
+`src/graph_builder.py`'s, shared with the vision, SmolVLA, Moonshine and Piper
+frontends (doc/plans/CHAT_PLAN.md §30).  Entries (T rows, C = context incl. the sink):
 
 | entry | inputs | outputs | |
 |---|---|---|---|

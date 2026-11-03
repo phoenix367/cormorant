@@ -55,25 +55,18 @@ Decode attention (``decode_attn``, with prefill_attn "fpga"):
 
 from __future__ import annotations
 
-import json
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import onnx
-import onnx.helper as oh
-import onnx.numpy_helper as nph
 from onnx import TensorProto
 
-from . import numeric
 from . import rope
-from .checkpoint import LazySafetensors, load_safetensors
+from .graph_builder import (RES_BITS, ExponentTable, GraphBuilder, cheapest_qk_kw, entry_info,
+                            group_order, pv_exp, score_exp)
 from .llm_arch import LlamaConfig
 from .llm_nodes import LLM_DOMAIN
-from .llm_weights import prepare, rope_spec
-
-# The shift of the kernels' output (floor(acc / 2^F)); ap_fixed<16,8>.
-F = 8
-RES_BITS = 15           # the int32 DMA residual's exponent (rowops; HOSTOPS_PLAN §5.1: r15)
+from .llm_weights import LINEARS, prepare, rope_spec
 
 
 # ------------------------------------------------------------------ #
@@ -88,42 +81,25 @@ def rope_tables(cfg: LlamaConfig, n: int):
     return rope.half_tables(rope_spec(cfg), n)
 
 
-# The linears: (key, file name, input class, output class) — llm_study.LINEARS
-LINEARS = (("q", "self_attn.q_proj", "x", "q0"), ("k", "self_attn.k_proj", "x", "k0"),
-           ("v", "self_attn.v_proj", "x", "v"), ("o", "self_attn.o_proj", "pv", "o"),
-           ("g", "mlp.gate_proj", "x2", "g"), ("u", "mlp.up_proj", "x2", "u"),
-           ("d", "mlp.down_proj", "a", "d"))
-
-
 # ------------------------------------------------------------------ #
 # Formats                                                              #
 # ------------------------------------------------------------------ #
 
-class Formats:
+class Formats(ExponentTable):
     """Exponents per ``class@layer`` (llm_study.py ``formats`` JSON; layer L
     = the final norm / LM head) and the sink rows."""
 
     def __init__(self, d: dict, cfg: LlamaConfig):
+        super().__init__(d)
         self.cfg = cfg
-        self.exp = {k: v for k, v in d["exponents"].items()}
         self.sink_k = d.get("sink_k_raw")
         self.sink_v = d.get("sink_v_raw")
-        self.policy = d.get("policy", "")
-
-    @classmethod
-    def from_file(cls, path: str, cfg: LlamaConfig) -> "Formats":
-        with open(path) as f:
-            return cls(json.load(f), cfg)
 
     def get(self, cls_: str, layer: int, n: int) -> np.ndarray:
         """Exponent vector of length n (a scalar is broadcast).  A class the
         calibration did not write is an error, not a default: a new tensor
         class (or a misspelled one) would otherwise run at 2^-F silently."""
-        try:
-            v = self.exp[f"{cls_}@{layer}"]
-        except KeyError:
-            raise KeyError(f"formats: no exponent for {cls_}@{layer} (policy {self.policy!r})") from None
-        return np.broadcast_to(np.asarray(v, np.int64), (n,)).copy()
+        return self.lookup(f"{cls_}@{layer}", n)
 
     def heads(self, cls_: str, layer: int, n_heads: int) -> np.ndarray:
         return self.get(cls_, layer, n_heads)
@@ -141,38 +117,20 @@ class Formats:
     def pv(self, li: int) -> np.ndarray:
         """P.V output exponent per channel of [H*HD]: f_p[h] + f_vc[g(h)] - F."""
         c = self.cfg
-        grp = np.arange(c.H) // (c.H // c.KV)
-        fp = self.heads("p", li, c.H)
-        vc = self.v_cache(li).reshape(c.KV, c.HD)
         if f"pv@{li}" in self.exp:
             return self.get("pv", li, c.H * c.HD)
-        return (fp[:, None] + vc[grp] - F).reshape(-1)
-
-
-def graph_with_initializers(nodes, name, inputs, outputs, inits: Dict[str, np.ndarray],
-                            value_info) -> onnx.GraphProto:
-    """``oh.make_graph`` with ``inits`` ({name: array}) converted to float32
-    TensorProtos one at a time, straight into the graph: one copy of each
-    weight, not a second set of TensorProtos beside the graph's."""
-    g = oh.make_graph(nodes, name, inputs, outputs, value_info=value_info)
-    for n, arr in inits.items():
-        g.initializer.append(nph.from_array(np.ascontiguousarray(arr, np.float32), n))
-    return g
-
-
-def _compact(e: np.ndarray):
-    """An int when every channel has the same exponent, else a list."""
-    e = np.asarray(e, np.int64).reshape(-1)
-    return int(e[0]) if (e == e[0]).all() else [int(v) for v in e]
+        return pv_exp(self.heads("p", li, c.H), self.v_cache(li), c.KV, c.HD)
 
 
 # ------------------------------------------------------------------ #
 # Graph builder                                                        #
 # ------------------------------------------------------------------ #
 
-class LlamaFrontend:
+class LlamaFrontend(GraphBuilder):
     """Builds the entry graphs of one model.  ``weights``: the checkpoint's
     tensors by Hugging Face name (float32), ``formats``: see Formats."""
+
+    PRODUCER = "inference-scheduler/src/llama.py"
 
     def __init__(self, cfg: LlamaConfig, weights: Dict[str, np.ndarray], formats: Formats,
                  ctx: int = 1024, name: str = "llama", prefill_attn: str = "fpga",
@@ -274,56 +232,20 @@ class LlamaFrontend:
             return self._build_head()
         raise ValueError(kind)
 
-    def _new(self, ename):
-        self._nodes: List[onnx.NodeProto] = []
-        self._vi: Dict[str, onnx.ValueInfoProto] = {}
-        self._inits: Dict[str, np.ndarray] = {}      # converted in _model
-        self._meta = numeric.empty()
-        self._e = ename
-
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False, dma=None):
-        if name not in self._vi:
-            self._vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
-        if exp is not None:
-            self._meta["exp"][name] = _compact(exp)
-        if host is not None:
-            self._meta["host"][name] = host
-        if dma is not None:
-            self._meta["dma"][name] = dma
-        if state and name not in self._meta["state"]:
-            self._meta["state"].append(name)
-        return name
-
-    def _init(self, name, arr):
-        if name not in self._inits:
-            self._inits[name] = arr
-        return name
-
-    def _node(self, op, ins, outs, name, domain="", **attrs):
-        self._nodes.append(oh.make_node(op, ins, outs, name=name, domain=domain, **attrs))
-
-    def _matmul(self, li, key, x, T, out_exp, lm=False):
-        c = self.cfg
+    def _linear(self, li, key, x, T, out_exp, lm=False):
+        """Layer li's linear ``key`` (LINEARS), or the LM head."""
+        e = self._e
         if lm:
-            wname, W = "w.lm_head", self.lm_weight().T
-        else:
-            fname = dict((k, f) for k, f, _, _ in LINEARS)[key]
-            wname, W = f"w.l{li}.{key}", self._w(li, fname).T
-        K, M = W.shape
-        self._init(wname, W)
-        y = self._t(f"{self._e}.l{li}.{key}" if not lm else f"{self._e}.logits_q", [T, M],
-                    exp=out_exp)
-        self._node("MatMul", [x, wname], [y], f"{self._e}.l{li}.{key}_proj" if not lm
-                   else f"{self._e}.lm_head")
-        del c
-        return y
+            return self._matmul(x, "w.lm_head", self.lm_weight().T, T, f"{e}.logits_q", out_exp,
+                                f"{e}.lm_head")
+        fname = dict((k, f) for k, f, _, _ in LINEARS)[key]
+        return self._matmul(x, f"w.l{li}.{key}", self._w(li, fname).T, T, f"{e}.l{li}.{key}", out_exp,
+                            f"{e}.l{li}.{key}_proj")
 
     def _res(self, name, T, state=False):
-        """A residual-stream tensor [T][D]: float32 host, or with rowops the int32
-        DMA tensor at 2^-RES_BITS."""
-        if self.rowops:
-            return self._t(name, [T, self.cfg.D], exp=RES_BITS, dma="i32", state=state)
-        return self._t(name, [T, self.cfg.D], host="f32", state=state)
+        """A residual-stream tensor [T][D]: with rowops the int32 DMA tensor, else
+        float32 host."""
+        return self._residual(name, T, self.cfg.D, self.rowops, state)
 
     def _resadd(self, h, delta, out, T, name, key, li):
         if self.rowops:
@@ -348,20 +270,8 @@ class LlamaFrontend:
         by cost_model.conv_cycles at C / 2 keys."""
         if self.qk_kw is not None:
             return int(self.qk_kw)
-        from .cost_model import conv_cycles
         c = self.cfg
-        M = (c.H // c.KV) * T
-        keys = max(16, (self.C // 2) // 16 * 16)
-        best = None
-        for kw in (1, 2, 4):
-            if c.HD % (16 * kw):
-                continue
-            for ow in [d for d in range(8, 65) if M % d == 0] or [M]:
-                cyc = conv_cycles(in_ch=c.HD // kw, out_ch=keys, in_h=M // ow, in_w=kw * ow,
-                                  oh=M // ow, ow=ow, kh=1, kw=kw, sw=kw)["total"]
-                if best is None or cyc < best[0]:
-                    best = (cyc, kw)
-        return best[1]
+        return cheapest_qk_kw(c.HD, (c.H // c.KV) * T, max(16, (self.C // 2) // 16 * 16))
 
     def _caches(self, li):
         c, fm = self.cfg, self.fmt
@@ -376,18 +286,14 @@ class LlamaFrontend:
 
     def _fpga_attention(self, li, q0, k0, v, T, pos, n, kc, vc):
         """Per layer: LlmAttnPrep, then per KV group q.K^T (ConvKernel), the
-        p12 softmax (host) and P.V (ConvKernel), then LlmAttnMerge.  Node
-        order q.K^T 0, q.K^T 1, softmax 0, P.V 0, then per group g >= 1
-        softmax g, q.K^T g+1, P.V g: the ConvKernel runs one call at a time
-        and the host issues them in order, so each softmax follows a call it
-        can hide behind — softmax 0 the short q.K^T 1, every later one the
-        long P.V of the previous group."""
+        p12 softmax (host) and P.V (ConvKernel), then LlmAttnMerge — in the
+        order graph_builder.group_order "ahead1": each softmax follows a
+        ConvKernel call it can hide behind."""
         c, fm, e = self.cfg, self.fmt, self._e
         G, KV, HD, H = c.H // c.KV, c.KV, c.HD, c.H
-        grp = np.arange(H) // G
         fq = fm.heads("q", li, H)
         fk = fm.heads("k", li, KV)
-        fs = (fm.heads("s", li, H) if f"s@{li}" in fm.exp else fq + fk[grp] - F)
+        fs = fm.heads("s", li, H) if f"s@{li}" in fm.exp else score_exp(fq, fk, KV)
         fp = fm.heads("p", li, H)
         # rowops (HOSTOPS_PLAN §10): the prefill's prep runs on the unit, which
         # writes the q image at kw = 1 (its TRANSPOSE granules are one column)
@@ -440,16 +346,9 @@ class LlamaFrontend:
         def pv_(g):
             self._node("LlmAttnPV", [p[g], vc, pos, n], [o[g]], f"{e}.l{li}.pv{g}",
                        domain=LLM_DOMAIN, group=g, **common)
-        qk(0)
-        if KV > 1:
-            qk(1)
-        softmax(0)
-        pv_(0)
-        for g in range(1, KV):
-            softmax(g)
-            if g + 1 < KV:
-                qk(g + 1)
-            pv_(g)
+        stage = {"qk": qk, "softmax": softmax, "pv": pv_}
+        for st, g in group_order(KV, "ahead1"):
+            stage[st](g)
         pv = self._t(f"{e}.l{li}.pv", [T, H * HD], exp=fm.pv(li))
         self._node("LlmAttnMerge", o, [pv], f"{e}.l{li}.attn_merge", domain=LLM_DOMAIN,
                    num_heads=H, num_kv_heads=KV, head_dim=HD)
@@ -462,9 +361,9 @@ class LlamaFrontend:
         for li in range(c.L):
             x = self._rmsnorm(h, f"g.l{li}.in", self.W[f"model.layers.{li}.input_layernorm.weight"],
                               T, f"{e}.l{li}.x", fm.get("x", li, c.D), f"{e}.l{li}.norm_in")
-            q0 = self._matmul(li, "q", x, T, fm.get("q0", li, c.H * c.HD))
-            k0 = self._matmul(li, "k", x, T, fm.get("k0", li, c.KV * c.HD))
-            v = self._matmul(li, "v", x, T, fm.get("v", li, c.KV * c.HD))
+            q0 = self._linear(li, "q", x, T, fm.get("q0", li, c.H * c.HD))
+            k0 = self._linear(li, "k", x, T, fm.get("k0", li, c.KV * c.HD))
+            v = self._linear(li, "v", x, T, fm.get("v", li, c.KV * c.HD))
             kc, vc = self._caches(li)
             if self.prefill_attn == "fpga" and (n is not None or self.decode_attn == "fpga"):
                 pv = self._fpga_attention(li, q0, k0, v, T, pos, n or "", kc, vc)
@@ -474,17 +373,17 @@ class LlamaFrontend:
                                             "rope.sin"],
                            [pv], f"{e}.l{li}.attn", domain=LLM_DOMAIN,
                            num_heads=c.H, num_kv_heads=c.KV, head_dim=c.HD)
-            o = self._matmul(li, "o", pv, T, fm.get("o", li, c.D))
+            o = self._linear(li, "o", pv, T, fm.get("o", li, c.D))
             h1 = self._resadd(h, o, f"{e}.l{li}.h1", T, f"{e}.l{li}.res_attn", "o", li)
             x2 = self._rmsnorm(h1, f"g.l{li}.post",
                                self.W[f"model.layers.{li}.post_attention_layernorm.weight"],
                                T, f"{e}.l{li}.x2", fm.get("x2", li, c.D), f"{e}.l{li}.norm_post")
-            g = self._matmul(li, "g", x2, T, fm.get("g", li, c.FF))
-            u = self._matmul(li, "u", x2, T, fm.get("u", li, c.FF))
+            g = self._linear(li, "g", x2, T, fm.get("g", li, c.FF))
+            u = self._linear(li, "u", x2, T, fm.get("u", li, c.FF))
             a = self._t(f"{e}.l{li}.a", [T, c.FF], exp=fm.get("a", li, c.FF))
             self._node("LlmSiluMul", [g, u], [a], f"{e}.l{li}.silu_mul", domain=LLM_DOMAIN,
                        **(dict(rowops=1) if self.rowops else {}))
-            d = self._matmul(li, "d", a, T, fm.get("d", li, c.D))
+            d = self._linear(li, "d", a, T, fm.get("d", li, c.D))
             h = self._resadd(h1, d, f"{e}.l{li}.h2", T, f"{e}.l{li}.res_mlp", "d", li)
         return h
 
@@ -492,7 +391,7 @@ class LlamaFrontend:
         c, fm, e, L = self.cfg, self.fmt, self._e, self.cfg.L
         xf = self._rmsnorm(h, "g.final", self.W["model.norm.weight"], 1, f"{e}.xf",
                            fm.get("xf", L, c.D), f"{e}.norm_final")
-        lq = self._matmul(L, "lm", xf, 1, fm.get("logits", L, c.V), lm=True)
+        lq = self._linear(L, "lm", xf, 1, fm.get("logits", L, c.V), lm=True)
         y = self._t(f"{e}.logits", [1, c.V], host="f32")
         if self.rowops:                     # the unit's DEQUANT into a float32 DMA row, then the copy out
             yd = self._t(f"{e}.logits_d", [1, c.V], dma="f32")
@@ -543,36 +442,13 @@ class LlamaFrontend:
         return self._model("head", [], [y])
 
     def _model(self, ename, inputs, outputs):
-        g = graph_with_initializers(
-            self._nodes, f"{self.name}_{ename}",
-            [self._vi[n] for n in inputs], [self._vi[n] for n in outputs], self._inits,
-            value_info=[vi for n, vi in self._vi.items() if n not in inputs and n not in outputs])
-        self._inits = {}
-        m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17),
-                                            oh.make_opsetid(LLM_DOMAIN, 1)],
-                          producer_name="inference-scheduler/src/llama.py")
-        m.ir_version = 8
-        p = m.metadata_props.add()
-        p.key = numeric.METADATA_KEY
-        p.value = numeric.to_metadata(self._meta)
-        p = m.metadata_props.add()
-        p.key = "axi.llm.entry"
-        p.value = json.dumps({"entry": ename, "model": self.name, "context": self.C,
-                              "prefill_attn": self.prefill_attn, "decode_attn": self.decode_attn,
-                              "pv_kw": self.pv_kw,
-                              "layers": self.cfg.L, "hidden": self.cfg.D, "heads": self.cfg.H,
-                              "kv_heads": self.cfg.KV, "head_dim": self.cfg.HD,
-                              "vocab": self.cfg.V}
-                             | ({"image_rows": self.image_rows} if self.image_rows else {}))
-        return m
+        c = self.cfg
+        return self._make_model(f"{self.name}_{ename}", inputs, outputs,
+                                {"entry": ename, "model": self.name, "context": self.C,
+                                 "prefill_attn": self.prefill_attn, "decode_attn": self.decode_attn,
+                                 "pv_kw": self.pv_kw, "layers": c.L, "hidden": c.D, "heads": c.H,
+                                 "kv_heads": c.KV, "head_dim": c.HD, "vocab": c.V}
+                                | ({"image_rows": self.image_rows} if self.image_rows else {}))
 
 
-def entry_info(model: onnx.ModelProto) -> Optional[dict]:
-    for p in model.metadata_props:
-        if p.key == "axi.llm.entry":
-            return json.loads(p.value)
-    return None
-
-
-__all__ = ("LlamaConfig", "LlamaFrontend", "Formats", "load_safetensors", "LazySafetensors",
-           "graph_with_initializers", "rope_tables", "entry_info", "LINEARS")
+__all__ = ("LlamaConfig", "LlamaFrontend", "Formats", "rope_tables", "entry_info", "LINEARS")

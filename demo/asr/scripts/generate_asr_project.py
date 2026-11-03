@@ -43,7 +43,7 @@ sys.path.insert(0, os.path.join(REPO, "inference-scheduler"))
 from src.asr_nodes import AsrArgmaxNode                 # noqa: E402
 from src.codegen.multi import MultiEntryGenerator       # noqa: E402
 from src.graph import OnnxGraph                         # noqa: E402
-from src.llama import load_safetensors                  # noqa: E402
+from src.checkpoint import load_safetensors             # noqa: E402
 from src.matmul_lowering import shared_weight_layouts    # noqa: E402
 from src.moonshine import BUCKETS, MoonshineConfig, MoonshineFormats, MoonshineFrontend, samples   # noqa: E402
 

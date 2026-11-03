@@ -39,21 +39,16 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import onnx
-import onnx.helper as oh
-import onnx.numpy_helper as nph
-from onnx import TensorProto
 
-from . import numeric
-from .llama import graph_with_initializers
+from .graph_builder import (RES_BITS, ExponentTable, GraphBuilder, cheapest_qk_kw, group_order, pv_exp,
+                            score_exp)
 from .llm_nodes import LLM_DOMAIN
 
-F = 8                                  # the kernels' output shift
 VP = "model.vision_model."
-RES_BITS = 15           # the int32 DMA residual's exponent with rowops (doc/plans/HOSTOPS_PLAN.md §5.1: r15)
 IEMBED_DEFAULT = False  # rowops: the patch-embedding add on the unit too (the position table rounded once at
                         # 2^-RES_BITS as an int32 stream; vlm_study's policy ...+rowops+iembed, RPU_PLAN §3.1)
 CONN = "model.connector.modality_projection.proj.weight"
@@ -160,30 +155,22 @@ class VitConfig:
             return cls.from_dict(json.load(f))
 
 
-class VisionFormats:
+class VisionFormats(ExponentTable):
     """Exponents per ``class@layer`` (vlm_study.py vision formats JSON; layer
     L = the post-LayerNorm and the connector)."""
 
     def __init__(self, d: dict, cfg: VitConfig):
+        super().__init__(d)
         self.cfg = cfg
-        self.exp = dict(d["exponents"])
-        self.policy = d.get("policy", "")
         if int(d.get("pixel_exp", 0)) != 0:
             raise ValueError("vision formats: pixel_exp must be 0 (raw uint8 pixels)")
 
-    @classmethod
-    def from_file(cls, path: str, cfg: VitConfig) -> "VisionFormats":
-        with open(path) as f:
-            return cls(json.load(f), cfg)
-
     def get(self, cls_: str, layer: int, n: int) -> np.ndarray:
-        v = self.exp.get(f"{cls_}@{layer}", F)
-        return np.broadcast_to(np.asarray(v, np.int64), (n,)).copy()
+        return self.lookup(f"{cls_}@{layer}", n)
 
     def pv(self, li: int) -> np.ndarray:
         c = self.cfg
-        fp = self.get("p", li, c.H)
-        return (fp[:, None] + self.get("vc", li, c.D).reshape(c.H, c.HD) - F).reshape(-1)
+        return pv_exp(self.get("p", li, c.H), self.get("vc", li, c.D), c.H, c.HD)
 
 
 def _gelu_vop_rows(b, ef, ea, n):
@@ -202,11 +189,6 @@ def _gelu_vop_rows(b, ef, ea, n):
     if not (np.all(np.abs(ba) < 32768) and np.all((sc < 32768) & (sc >= 1))):
         return None
     return (ba / 256.0).astype(np.float32), (sc / 256.0).astype(np.float32)
-
-
-def _compact(e):
-    e = np.asarray(e, np.int64).reshape(-1)
-    return int(e[0]) if (e == e[0]).all() else [int(v) for v in e]
 
 
 def patch_weight(W: Dict[str, np.ndarray], cfg: VitConfig) -> np.ndarray:
@@ -234,10 +216,12 @@ def patches(rgb: np.ndarray, P: int) -> np.ndarray:
     return np.ascontiguousarray(x.reshape(n * n, 3 * P * P))
 
 
-class VitFrontend:
+class VitFrontend(GraphBuilder):
     """Builds the ``vision`` entry.  ``weights``: the checkpoint's tensors by
     Hugging Face name (float32); ``image_state``: the float32 host state the
     image features go to (read by the text model's prefill LlmEmbed)."""
+
+    PRODUCER = "inference-scheduler/src/vit.py"
 
     def __init__(self, cfg: VitConfig, weights: Dict[str, np.ndarray], formats: VisionFormats,
                  name: str = "vit", image_state: str = "vlm.img", conn_k: int = 4096,
@@ -310,62 +294,13 @@ class VitFrontend:
         cost model at N keys (head_dim % 16 kw == 0)."""
         if self.qk_kw is not None:
             return int(self.qk_kw)
-        from .cost_model import conv_cycles
-        c = self.cfg
-        M, keys = c.N, c.N
-        best = None
-        for kw in (1, 2, 4):
-            if c.HD % (16 * kw):
-                continue
-            for ow in [d for d in range(8, 65) if M % d == 0] or [M]:
-                cyc = conv_cycles(in_ch=c.HD // kw, out_ch=keys, in_h=M // ow, in_w=kw * ow,
-                                  oh=M // ow, ow=ow, kh=1, kw=kw, sw=kw)["total"]
-                if best is None or cyc < best[0]:
-                    best = (cyc, kw)
-        return best[1]
+        return cheapest_qk_kw(self.cfg.HD, self.cfg.N, self.cfg.N)
 
-    # ---- builder helpers (src/llama.py's conventions) ------------------------ #
-    def _new(self):
-        self._nodes: List[onnx.NodeProto] = []
-        self._vi: Dict[str, onnx.ValueInfoProto] = {}
-        self._inits: Dict[str, np.ndarray] = {}      # converted in _model
-        self._int_inits: Dict[str, np.ndarray] = {}  # int64 (a Slice's starts / ends)
-        self._meta = numeric.empty()
-
+    # ---- builder helpers (GraphBuilder's and these) ---------------------------- #
     def _res(self, name, rows=None):
-        """A residual-stream tensor [N][D] (or ``rows`` of it): float32 host, or
-        with rowops the int32 DMA tensor at 2^-RES_BITS."""
-        rows = self.cfg.N if rows is None else rows
-        if self.rowops:
-            return self._t(name, [rows, self.cfg.D], exp=RES_BITS, dma="i32")
-        return self._t(name, [rows, self.cfg.D], host="f32")
-
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False, dma=None):
-        if name not in self._vi:
-            self._vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
-        if dma is not None:
-            self._meta["dma"][name] = dma
-        if exp is not None:
-            self._meta["exp"][name] = _compact(exp)
-        if host is not None:
-            self._meta["host"][name] = host
-        if state and name not in self._meta["state"]:
-            self._meta["state"].append(name)
-        return name
-
-    def _init(self, name, arr):
-        if name not in self._inits:
-            self._inits[name] = arr
-        return name
-
-    def _node(self, op, ins, outs, name, domain="", **attrs):
-        self._nodes.append(oh.make_node(op, ins, outs, name=name, domain=domain, **attrs))
-
-    def _matmul(self, x, wname, W, T, y, exp, name):
-        self._init(wname, W)
-        self._t(y, [T, W.shape[1]], exp=exp)
-        self._node("MatMul", [x, wname], [y], name)
-        return y
+        """A residual-stream tensor [N][D] (or ``rows`` of it): with rowops the int32
+        DMA tensor, else float32 host."""
+        return self._residual(name, self.cfg.N if rows is None else rows, self.cfg.D, self.rowops)
 
     def _vec(self, name, arr):
         return self._init(name, np.asarray(arr, np.float32).reshape(-1))
@@ -519,9 +454,9 @@ class VitFrontend:
     def _slice_rows(self, x, r0, n, y, exp):
         """y = x[r0 : r0 + n] — a view (the scheduler's Slice views)."""
         s, e = f"vision.rows{r0}.s", f"vision.rows{r0}.e"
-        self._int_inits.setdefault(s, np.array([r0], np.int64))
-        self._int_inits.setdefault(e, np.array([r0 + n], np.int64))
-        self._int_inits.setdefault("vision.axis0", np.array([0], np.int64))
+        self._int_init(s, np.array([r0], np.int64))
+        self._int_init(e, np.array([r0 + n], np.int64))
+        self._int_init("vision.axis0", np.array([0], np.int64))
         self._t(y, [n, self.cfg.D], exp=exp)
         self._node("Slice", [x, s, e, "vision.axis0"], [y], y.replace("vision.", "vision.slice_"))
         return y
@@ -632,7 +567,7 @@ class VitFrontend:
         c, fm, W = self.cfg, self.fmt, self.W
         N, D, H, HD = c.N, c.D, c.H, c.HD
         fq, fk, fp = fm.get("q", li, H), fm.get("k", li, H), fm.get("p", li, H)
-        fs = fq + fk - F
+        fs = score_exp(fq, fk, H)
         qx = self._t(f"{e}.qx", [H, HD, N], exp=0)
         self._node("VitAttnPrep", [q0, k0, v0, kc, vc,
                                    self._vec(f"v.l{li}.bq", W[lw + "self_attn.q_proj.bias"]),
@@ -664,10 +599,6 @@ class VitFrontend:
         def pv_(g, p=p, o=o, e=e):
             self._node("LlmAttnPV", [p[g], vc], [o[g]], f"{e}.pv{g}", domain=LLM_DOMAIN,
                        group=g, **common)
-        # ConvKernel runs qk(g+1) under softmax(g); pv(g) then qk(g+2)
-        # follow right away, so the CPU waits only for the short P.V to
-        # free the lane (qk(g+1) after softmax(g) waited for the longer
-        # qk before the next softmax)
         def softmax_r(g, r, s=s, pr=None if R == 1 else pr, e=e, fs=fs, fp=fp, R=R):
             self._node("VitAttnSoftmax", [s[g]], [pr[g][r]], f"{e}.softmax{g}r{r}",
                        domain=LLM_DOMAIN, head_dim=HD, s_exp=[int(fs[g])],
@@ -686,20 +617,13 @@ class VitFrontend:
                 pipe.add("conv", macs * ATTN_US_PER_MAC["pv_conv"], [p[g]], [o[g]], lambda g=g: pv_(g))
             pipe.flush()
         else:
-            qk(0)
-            if H > 1:
-                qk(1)
-            for g in range(H):
-                if R == 1:
-                    softmax(g)
-                    pv_(g)
-                else:
-                    for r in range(R):
-                        softmax_r(g, r)
-                    for r in range(R):
-                        pv_r(g, r)
-                if g + 2 < H:
-                    qk(g + 2)
+            # graph_builder.group_order "ahead2": ConvKernel runs q.K^T g+1 under
+            # softmax g, so the CPU waits only for the short P.V to free the lane
+            stage = {"qk": qk, "softmax": softmax, "pv": pv_} if R == 1 else \
+                {"qk": qk, "softmax": lambda g: [softmax_r(g, r) for r in range(R)],
+                 "pv": lambda g: [pv_r(g, r) for r in range(R)]}
+            for st, g in group_order(H, "ahead2"):
+                stage[st](g)
         pv = self._t(f"{e}.pv", [N, D], exp=fm.pv(li))
         if R == 1:
             self._node("LlmAttnMerge", o, [pv], f"{e}.attn_merge", domain=LLM_DOMAIN,
@@ -711,26 +635,11 @@ class VitFrontend:
         return pv
 
     def _model(self, inputs, outputs):
-        g = graph_with_initializers(
-            self._nodes, f"{self.name}_vision",
-            [self._vi[n] for n in inputs], [self._vi[n] for n in outputs], self._inits,
-            value_info=[vi for n, vi in self._vi.items() if n not in inputs and n not in outputs])
-        for n, arr in self._int_inits.items():
-            g.initializer.append(nph.from_array(np.asarray(arr, np.int64), n))
-        self._inits, self._int_inits = {}, {}
-        m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17), oh.make_opsetid(LLM_DOMAIN, 1)],
-                          producer_name="inference-scheduler/src/vit.py")
-        m.ir_version = 8
-        p = m.metadata_props.add()
-        p.key = numeric.METADATA_KEY
-        p.value = numeric.to_metadata(self._meta)
-        p = m.metadata_props.add()
-        p.key = "axi.llm.entry"
         c = self.cfg
-        p.value = json.dumps({"entry": "vision", "model": self.name, "layers": c.L, "hidden": c.D,
-                              "heads": c.H, "head_dim": c.HD, "patch": c.P, "image": c.S,
-                              "image_tokens": c.n_img, "pv_kw": self.pv_kw})
-        return m
+        return self._make_model(f"{self.name}_vision", inputs, outputs,
+                                {"entry": "vision", "model": self.name, "layers": c.L, "hidden": c.D,
+                                 "heads": c.H, "head_dim": c.HD, "patch": c.P, "image": c.S,
+                                 "image_tokens": c.n_img, "pv_kw": self.pv_kw})
 
 
 __all__ = ("VitConfig", "VisionFormats", "VitFrontend", "default_pieces", "patch_weight", "patch_bias_table",

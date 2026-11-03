@@ -20,7 +20,7 @@ import gen_llama_models as G
 import src.graph as graph_mod
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
-from src.llama import LazySafetensors, load_safetensors
+from src.checkpoint import LazySafetensors, load_safetensors
 from src.llm_entries import EntryModels, entry_graphs
 
 _FE = None

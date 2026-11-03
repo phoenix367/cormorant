@@ -456,10 +456,8 @@ class Seq:
         self.n = 0
 
 
-# weights: (name in the file, input class, output class)
-LINEARS = {"q": ("self_attn.q_proj", "x", "q0"), "k": ("self_attn.k_proj", "x", "k0"),
-           "v": ("self_attn.v_proj", "x", "v"), "o": ("self_attn.o_proj", "pv", "o"),
-           "g": ("mlp.gate_proj", "x2", "g"), "u": ("mlp.up_proj", "x2", "u"), "d": ("mlp.down_proj", "a", "d")}
+# weights: (name in the layer, input class, output class) — src/llm_weights.py's table
+LINEARS = {k: (name, ci, co) for k, name, ci, co in weights().LINEARS}
 
 
 def lm_weight(W, cfg):

@@ -258,7 +258,7 @@ _TINY_FMT = os.path.join(_REPO, "demo", "asr", "moonshine-tiny_opt_formats.json"
                      and rowops_unit() and softmax_unit(), "needs the moonshine-tiny assets (asr_study.py fetch)")
 class TestMoonshineTiny(unittest.TestCase):
     def test_encoder_and_first_steps_match_specification(self):
-        from src.llama import load_safetensors
+        from src.checkpoint import load_safetensors
         cfgd, W64 = mn.load(_TINY)
         spec = mq.QM(cfgd, W64, pol=POLICY, fmt=mq.load_formats(_TINY_FMT))
         cfg = MoonshineConfig.from_dict(cfgd)

@@ -50,6 +50,13 @@ LAYER = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.
          "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm",
          "post_attention_layernorm")
 
+# The block's linears: (key, tensor name in the layer, input class, output class) —
+# the classes are the formats' (llm_study.py calibrates them, src/llama.py reads them)
+LINEARS = (("q", "self_attn.q_proj", "x", "q0"), ("k", "self_attn.k_proj", "x", "k0"),
+           ("v", "self_attn.v_proj", "x", "v"), ("o", "self_attn.o_proj", "pv", "o"),
+           ("g", "mlp.gate_proj", "x2", "g"), ("u", "mlp.up_proj", "x2", "u"),
+           ("d", "mlp.down_proj", "a", "d"))
+
 
 def rope_spec(cfg) -> "rope.RopeSpec":
     """The RoPE of a LlamaConfig (or the study's Cfg)."""

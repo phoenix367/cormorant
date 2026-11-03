@@ -34,6 +34,10 @@ Step 2 (2026-11-02): one tokenizer for every tokenizer.json, the checkpoint's
 own chat template, RoPE scaling / partial rotation / Granite / Phi-3 folded
 into the plain block (checked against transformers), any LLM served from a
 chat_config.json entry with no code (§29).
+Step 3 (2026-11-03): the five frontends (Llama, ViT, SmolVLA, Moonshine, Piper)
+build their graphs on one GraphBuilder, look their exponents up in one strict
+table and share the FPGA attention's helpers — every shipped entry graph
+unchanged (§30).
 Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
@@ -2764,3 +2768,66 @@ logits equal the simulation's); `llm_sched_check.py --save` regenerated it
 — 3 / 3 prompts and the second turn bit-exact, and only that entry changed.
 Tests: scheduler 1920, chat 334.
 
+## 30. Unseen models, step 3 — one builder for the frontends (2026-11-03)
+
+Steps 1–2 made a new Llama-family checkpoint work without code.  A model
+outside that family needs a frontend of its own, and the five that exist
+(`src/llama.py`, `vit.py`, `smolvla.py`, `moonshine.py`, `piper.py` with two
+classes) each carried a copy of the same plumbing — six `_new` / `_t` /
+`_init` / `_node` / `_matmul` / `_model` sets, four `_compact`, four formats
+classes, four `F` / `RES_BITS`.  Step 3 moves what they share into
+`src/graph_builder.py`, so the next frontend starts from it.
+
+**Shared now.**
+
+| piece | was | now |
+|---|---|---|
+| an entry graph's tensors and their `axi.numeric` metadata (exponents, per-channel Conv exponents, host / DMA kind, states), its float32 and int64 initializers, its nodes, the ModelProto with its info record | six copies | `GraphBuilder` (`_new`, `_t`, `_init`, `_int_init`, `_node` with a per-frontend default domain, `_matmul`, `_make_model`) |
+| the residual-stream tensor: int32 DMA at 2^-15 with the row-ops unit, else float32 host | four `_res` | `GraphBuilder._residual` |
+| the formats JSONs | four classes, three of them defaulting a missing class to 2^-8 | `ExponentTable` (`from_file`, `lookup`: a scalar broadcast, a per-head vector repeated over its channels); a class the calibration did not write is an error in every frontend now, as in the Llama one since §28 |
+| the q·Kᵀ scores' and P·V output's exponents | 12 inline formulas in four frontends | `score_exp`, `pv_exp` |
+| the q image's kernel width (the conv cost model's cheapest) | three copies | `cheapest_qk_kw` |
+| the per-group issue order of q·Kᵀ / softmax / P·V | two hand-written sequences | `group_order` "ahead1" (Llama) / "ahead2" (ViT), the reasoning once |
+| interleaved partial RoPE | Moonshine's own permutation and tables; SmolVLA's tables through a stand-in LlamaConfig | `rope.RopeSpec(interleaved=True)` / `rope.half_tables` of a padded head |
+| the block's linears and their formats classes | `llama.LINEARS` and `llm_study.LINEARS` | `llm_weights.LINEARS`, read by both |
+| an RMSNorm's eps attribute | two parses | `llm_nodes.norm_eps` |
+
+The frontends lose 430 lines net; with the module (262 lines,
+`test_graph_builder.py` 7 tests) the scheduler source is 151 lines shorter.
+The checkpoint readers are imported from `src/checkpoint.py` everywhere (no
+longer re-exported by `llama.py`).  The strict lookups changed no graph: before
+the switch every shipped entry and every frontend test was built with the
+defaults disabled — none used one.  SmolVLA's residual-exponent check skips
+the prefix's last layer explicitly (it has no o / d) instead of reading their
+absent classes.
+
+**Kept apart, on purpose.**
+- The attention sequences themselves: their tensors, ops and node orders
+  differ per model (SmolVLA's state row, Moonshine's cross attention, Piper's
+  relative-key band, the ViT's row pieces and query-major scores), and their
+  names fix the generated code; one emitter would be callbacks around five
+  special cases.  What they share — exponents, kernel width, orders — is
+  shared.
+- The decoder block of `llama.py` and SmolVLA's text layers: the prefix
+  interleaves the expert's cross caches into the same layers; one block would
+  need a hook in every stage for one user.
+- The study's tables (`silu_table`, `exp_table`, `dot8` in `llm_study.py`
+  beside `llm_nodes.py`'s): the study is the specification the gates compare
+  the scheduler with — sharing them would remove that comparison.
+- The gate scripts: `vlm_host_emu.py` already builds on `llm_host_emu` /
+  `llm_board`, `vlm_project.py` on `llm_project`; what remains is image
+  specific.  Piper's encoder keeps its plain loops (all scores first), the
+  stereo frontend its builder (it solves exponents while it builds).
+
+**Verification: every graph unchanged.**  Before the refactor I hashed every
+entry ModelProto, initializers included: the shipped models' 65 entries
+(SmolLM2-135M / 360M, stories15m, SmolVLM, SmolLM2-135M under five other
+policies, SmolVLA, Moonshine tiny / base, Piper's chunk in three variants and
+its encoder buckets in four), and the 320 graphs the scheduler suite hands to
+`OnnxGraph` in 157 tests.  After it, 62 / 65 and 315 / 320 are byte-identical;
+the others are Piper's chunk graphs, whose `Conv` nodes now set the default
+domain `""` explicitly (the field present instead of absent) and are
+identical once it is cleared.  The Piper and SmolLM2-135M projects regenerate
+byte-identical, weights included (apart from the timestamps).  Tests:
+scheduler 1927 (+7), chat 334, lint, facts.  No library changed, so no board
+run.

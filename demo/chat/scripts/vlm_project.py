@@ -24,8 +24,9 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 import llm_project as lp
+from src.checkpoint import LazySafetensors, load_safetensors
 from src.codegen import CodeGenerator
-from src.llama import Formats, LazySafetensors, LlamaConfig, LlamaFrontend, load_safetensors
+from src.llama import Formats, LlamaConfig, LlamaFrontend
 from src.llm_entries import entry_graphs
 from src.vit import VisionFormats, VitConfig, VitFrontend, patches
 

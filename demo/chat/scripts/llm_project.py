@@ -36,8 +36,8 @@ import llm_study as study                                         # noqa: E402
 from src.codegen import CodeGenerator                             # noqa: E402
 from src.graph import OnnxGraph                                   # noqa: E402
 from src.llm_entries import EntryModels, entry_graphs            # noqa: E402
-from src.llama import (Formats, LazySafetensors, LlamaConfig, LlamaFrontend,  # noqa: E402
-                       load_safetensors)
+from src.checkpoint import LazySafetensors, load_safetensors      # noqa: E402
+from src.llama import Formats, LlamaConfig, LlamaFrontend        # noqa: E402
 
 # The numeric policy (llm_study.py) per attention mode of the frontend
 # (src/llama.py), (prefill_attn, decode_attn): ("fpga", "host") — phase 5,

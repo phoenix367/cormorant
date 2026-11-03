@@ -51,21 +51,17 @@ Decoder (one token):
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 import onnx
-import onnx.helper as oh
 from onnx import TensorProto
 
-from . import numeric
-from .llama import graph_with_initializers
+from .graph_builder import ExponentTable, GraphBuilder, pv_exp, score_exp
 from .llm_nodes import LLM_DOMAIN
+from .rope import RopeSpec, half_tables, perm
 
-F = 8                                   # the kernels' output shift
-RES_BITS = 15                           # the int32 residual's exponent
 PHASES = 64                             # conv1's stride
 KEY_Q = 64                              # the attention's key quantum (16 x the V interleave 4)
 PV_KW = 4                               # the V caches' interleave
@@ -130,67 +126,37 @@ class MoonshineConfig:
         return -(-self.max_pos // KEY_Q) * KEY_Q
 
 
-class MoonshineFormats:
+class MoonshineFormats(ExponentTable):
     """Exponents per ``class@<part><layer>`` (part e / d / s / h: encoder,
     decoder, stem, head) — asr_study.py formats; the unpadded model's channels."""
 
     def __init__(self, d: dict, cfg: MoonshineConfig):
+        super().__init__(d)
         self.cfg = cfg
-        self.exp = dict(d["exponents"])
-        self.policy = d.get("policy", "")
-
-    @classmethod
-    def from_file(cls, path: str, cfg: MoonshineConfig) -> "MoonshineFormats":
-        with open(path) as f:
-            return cls(json.load(f), cfg)
 
     def get(self, cls_: str, part: str, layer: int, n: int) -> np.ndarray:
         """moonshine_q.QM.E: a scalar broadcast, a per-head vector repeated over the heads'
         channels where n = heads * hd."""
-        v = np.asarray(self.exp.get(f"{cls_}@{part}{layer}", F), np.int64).reshape(-1)
-        if v.size == 1:
-            return np.full(n, int(v[0]), np.int64)
-        if v.size == n:
-            return v.copy()
-        if n % v.size:
-            raise ValueError(f"formats: {cls_}@{part}{layer} has {v.size} values, {n} wanted")
-        return np.repeat(v, n // v.size)
+        return self.lookup(f"{cls_}@{part}{layer}", n)
 
     def heads(self, cls_: str, part: str, layer: int) -> np.ndarray:
         return self.get(cls_, part, layer, self.cfg.H)
-
-
-def _compact(e):
-    e = np.asarray(e, np.int64).reshape(-1)
-    return int(e[0]) if (e == e[0]).all() else [int(v) for v in e]
 
 
 # ------------------------------------------------------------------ #
 # Padded / permuted heads                                              #
 # ------------------------------------------------------------------ #
 
-def rope_perm(hd: int, rot: int) -> np.ndarray:
-    """moonshine_q.rope_perm: the head dims in rotate-half order (pair j of the
-    interleaved RoPE at (j, j + hd / 2), the pass-through dims paired)."""
-    half, npair = hd // 2, rot // 2
-    order = np.empty(hd, np.int64)
-    order[:npair] = np.arange(0, rot, 2)
-    order[half: half + npair] = np.arange(1, rot, 2)
-    rest = np.arange(rot, hd)
-    order[npair:half] = rest[: half - npair]
-    order[half + npair:] = rest[half - npair:]
-    return order
-
-
 def head_map(cfg: MoonshineConfig, rope: bool) -> np.ndarray:
     """[H * HDp] -> the source channel of the unpadded [H * hd] (-1: a zero channel):
-    rope — the rotate-half order with each half padded (pairs (j, j + HDp / 2)), else
+    rope — the rotate-half order of the interleaved partial rotation (rope.perm, as
+    moonshine_q.rope_perm) with each half padded (pairs (j, j + HDp / 2)), else
     the head's channels then zeros."""
     hd, P = cfg.hd, cfg.HDp
     m = np.full((cfg.H, P), -1, np.int64)
+    order = perm(RopeSpec(hd, cfg.theta, cfg.rot, interleaved=True))
     for h in range(cfg.H):
         if rope:
-            order = rope_perm(hd, cfg.rot)
             m[h, :hd // 2] = h * hd + order[:hd // 2]
             m[h, P // 2:P // 2 + hd // 2] = h * hd + order[hd // 2:]
         else:
@@ -224,18 +190,10 @@ def map_exp(e: np.ndarray, m: np.ndarray, P: int) -> np.ndarray:
 
 
 def rope_half_tables(cfg: MoonshineConfig, n: int):
-    """float32 cos / sin [n][HDp / 2] of the padded rotate-half pairs:
-    moonshine_q.rope_half_tables' values for the first hd / 2 pairs, cos 1 / sin 0
-    for the pass-through and the zero pairs."""
-    th, rot, P = cfg.theta, cfg.rot, cfg.HDp
-    inv = np.array([1.0 / (th ** (2 * j / rot)) for j in range(rot // 2)], np.float64).astype(np.float32)
-    ang = (np.arange(n, dtype=np.float32)[:, None] * inv[None, :]).astype(np.float32)
-    cs = np.vectorize(math.cos, otypes=[np.float64])(ang.astype(np.float64)).astype(np.float32)
-    sn = np.vectorize(math.sin, otypes=[np.float64])(ang.astype(np.float64)).astype(np.float32)
-    c = np.ones((n, P // 2), np.float32)
-    s = np.zeros((n, P // 2), np.float32)
-    c[:, :rot // 2], s[:, :rot // 2] = cs, sn
-    return c, s
+    """float32 cos / sin [n][HDp / 2] of the padded rotate-half pairs (rope.half_tables
+    of the padded head): moonshine_q.rope_half_tables' values for the rotated pairs,
+    cos 1 / sin 0 for the pass-through and the zero pairs."""
+    return half_tables(RopeSpec(cfg.HDp, cfg.theta, cfg.rot), n)
 
 
 def fold_dims(n_out: int, out_ch: int, stride: int, k: int):
@@ -249,9 +207,12 @@ def fold_dims(n_out: int, out_ch: int, stride: int, k: int):
     return rows, w, stride * w + k - stride
 
 
-class MoonshineFrontend:
+class MoonshineFrontend(GraphBuilder):
     """Builds the entries of one model.  ``weights``: the checkpoint's tensors by
     Hugging Face name (float32); ``formats``: MoonshineFormats."""
+
+    NODE_DOMAIN = LLM_DOMAIN
+    PRODUCER = "inference-scheduler/src/moonshine.py"
 
     def __init__(self, cfg: MoonshineConfig, weights: Dict[str, np.ndarray], formats: MoonshineFormats,
                  name: str = "moonshine"):
@@ -271,45 +232,9 @@ class MoonshineFrontend:
                 raise ValueError(f"formats: the encoder's GELU output of layer {li} must be at 2^-8 "
                                  f"(VectorOPKernel's activation unit)")
 
-    # ---- builder helpers (src/llama.py's conventions) ------------------------ #
-    def _new(self, ename):
-        self._nodes: List[onnx.NodeProto] = []
-        self._vi: Dict[str, onnx.ValueInfoProto] = {}
-        self._inits: Dict[str, np.ndarray] = {}
-        self._meta = numeric.empty()
-        self._e = ename
-
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, chexp=None, host=None, state=False, dma=None):
-        if name not in self._vi:
-            self._vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
-        if dma is not None:
-            self._meta["dma"][name] = dma
-        if exp is not None:
-            self._meta["exp"][name] = _compact(exp)
-        if chexp is not None:
-            self._meta["chexp"][name] = [int(v) for v in np.asarray(chexp).reshape(-1)]
-        if host is not None:
-            self._meta["host"][name] = host
-        if state and name not in self._meta["state"]:
-            self._meta["state"].append(name)
-        return name
-
-    def _init(self, name, arr):
-        if name not in self._inits:
-            self._inits[name] = np.asarray(arr, np.float32)
-        return name
-
-    def _node(self, op, ins, outs, name, domain=LLM_DOMAIN, **attrs):
-        self._nodes.append(oh.make_node(op, ins, outs, name=name, domain=domain, **attrs))
-
-    def _matmul(self, x, wname, W, T, y, exp, name):
-        self._init(wname, W)
-        self._t(y, [T, W.shape[1]], exp=exp)
-        self._node("MatMul", [x, wname], [y], name, domain="")
-        return y
-
+    # ---- builder helpers (GraphBuilder's and these) ---------------------------- #
     def _res(self, name, T):
-        return self._t(name, [T, self.cfg.d], exp=RES_BITS, dma="i32")
+        return self._residual(name, T, self.cfg.d)
 
     def _ln(self, h, gname, T, out, exp, name):
         g = self._init(f"g.{gname}", self.W[gname])
@@ -404,7 +329,7 @@ class MoonshineFrontend:
             self._node("LlmAttnPrep", [q0, k0, v0, zero, nf, kc, vc, "asr.enc.cos", "asr.enc.sin", qs, ks, vs],
                        [qx], f"{el}.attn_prep", qk_kw=1, q_exp=[int(v) for v in fq], rowops=1,
                        first=int(li == 0), **common)
-            fs, fp = fq + fk - F, fm.heads("p", *sc)
+            fs, fp = score_exp(fq, fk, c.H), fm.heads("p", *sc)
             o = []
             for g in range(c.H):
                 s_ = self._t(f"{el}.s{g}", [ENC_C, T], exp=0)
@@ -415,7 +340,7 @@ class MoonshineFrontend:
                            s_exp=[int(fs[g])], p_exp=[int(fp[g])], vsmx=1, causal=0, logit_scale=scale, **common)
                 self._node("LlmAttnPV", [p_, vc, zero, nf], [o_], f"{el}.pv{g}", group=g, **common)
                 o.append(o_)
-            pv = self._t(f"{el}.pv", [T, DP], exp=np.repeat(fp, P) + fvc - F)
+            pv = self._t(f"{el}.pv", [T, DP], exp=pv_exp(fp, fvc, c.H, P))
             self._node("LlmAttnMerge", o, [pv], f"{el}.attn_merge", num_heads=c.H, num_kv_heads=c.H, head_dim=P)
             ov = self._matmul(pv, f"w.enc.l{li}.o", map_rows(self._w(lw + "self_attn.o_proj.weight").T, self.mp), T,
                               f"{el}.o", fm.get("o", *sc, d), f"{el}.o_proj")
@@ -521,7 +446,7 @@ class MoonshineFrontend:
             qx = self._t(f"{el}.qx", [c.H, P, 1], exp=0)
             self._node("LlmAttnPrep", [q0, k0, v0, pos, "", kc, vc, "asr.dec.cos", "asr.dec.sin", qs, ks, vs],
                        [qx], f"{el}.attn_prep", qk_kw=1, q_exp=[int(v) for v in fq], rowops=1, **common)
-            fs, fp = fq + fk - F, fm.heads("p", *sc)
+            fs, fp = score_exp(fq, fk, c.H), fm.heads("p", *sc)
             o = []
             for g in range(c.H):
                 s_ = self._t(f"{el}.s{g}", [C, 1], exp=0)
@@ -532,7 +457,7 @@ class MoonshineFrontend:
                            s_exp=[int(fs[g])], p_exp=[int(fp[g])], logit_scale=scale, **common)
                 self._node("LlmAttnPV", [p_, vc, pos, ""], [o_], f"{el}.pv{g}", group=g, **common)
                 o.append(o_)
-            pv = self._t(f"{el}.pv", [1, DP], exp=np.repeat(fp, P) + fvc - F)
+            pv = self._t(f"{el}.pv", [1, DP], exp=pv_exp(fp, fvc, c.H, P))
             self._node("LlmAttnMerge", o, [pv], f"{el}.attn_merge", num_heads=c.H, num_kv_heads=c.H, head_dim=P)
             ov = self._matmul(pv, f"w.dec.l{li}.o", map_rows(self._w(lw + "self_attn.o_proj.weight").T, self.mp), 1,
                               f"{el}.o", fm.get("o", *sc, d), f"{el}.o_proj")
@@ -547,7 +472,7 @@ class MoonshineFrontend:
             cqx = self._t(f"{el}.cqx", [c.H, P, 1], exp=0)
             self._node("AsrCrossQ", [cq], [cqx], f"{el}.cross_q_image")
             ckc, cvc = self._cross_caches(li)
-            fcs, fcp = fcq + fck - F, fm.heads("cp", *sc)
+            fcs, fcp = score_exp(fcq, fck, c.H), fm.heads("cp", *sc)
             fcv = map_exp(fm.get("cv", *sc, d), self.mp, P)
             co = []
             for g in range(c.H):
@@ -559,7 +484,7 @@ class MoonshineFrontend:
                            s_exp=[int(fcs[g])], p_exp=[int(fcp[g])], logit_scale=scale, **common)
                 self._node("LlmAttnPV", [p_, cvc, xpos, ""], [o_], f"{el}.cpv{g}", group=g, **common)
                 co.append(o_)
-            cpv = self._t(f"{el}.cpv", [1, DP], exp=np.repeat(fcp, P) + fcv - F)
+            cpv = self._t(f"{el}.cpv", [1, DP], exp=pv_exp(fcp, fcv, c.H, P))
             self._node("LlmAttnMerge", co, [cpv], f"{el}.cross_merge", num_heads=c.H, num_kv_heads=c.H, head_dim=P)
             cov = self._matmul(cpv, f"w.dec.l{li}.co",
                                map_rows(self._w(lw + "encoder_attn.o_proj.weight").T, self.mp), 1, f"{el}.co",
@@ -598,25 +523,12 @@ class MoonshineFrontend:
         return out
 
     def _model(self, ename, inputs, outputs, info):
-        g = graph_with_initializers(
-            self._nodes, f"{self.name}_{ename}",
-            [self._vi[n] for n in inputs], [self._vi[n] for n in outputs], self._inits,
-            value_info=[vi for n, vi in self._vi.items() if n not in inputs and n not in outputs])
-        self._inits = {}
-        m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17), oh.make_opsetid(LLM_DOMAIN, 1)],
-                          producer_name="inference-scheduler/src/moonshine.py")
-        m.ir_version = 8
-        p = m.metadata_props.add()
-        p.key = numeric.METADATA_KEY
-        p.value = numeric.to_metadata(self._meta)
-        p = m.metadata_props.add()
-        p.key = "axi.llm.entry"
         c = self.cfg
-        p.value = json.dumps(dict(info, model=self.name, hidden=c.d, heads=c.H, head_dim=c.hd, head_pad=c.HDp,
-                                  enc_layers=c.L, dec_layers=c.Ld, vocab=c.V, bos=c.bos, eos=c.eos,
-                                  max_pos=c.max_pos, cache_rows=ENC_C, dec_cache_rows=c.dec_C))
-        return m
+        return self._make_model(f"{self.name}_{ename}", inputs, outputs,
+                                dict(info, model=self.name, hidden=c.d, heads=c.H, head_dim=c.hd, head_pad=c.HDp,
+                                     enc_layers=c.L, dec_layers=c.Ld, vocab=c.V, bos=c.bos, eos=c.eos,
+                                     max_pos=c.max_pos, cache_rows=ENC_C, dec_cache_rows=c.dec_C))
 
 
 __all__ = ("MoonshineConfig", "MoonshineFormats", "MoonshineFrontend", "BUCKETS", "samples", "stem_frames",
-           "rope_perm", "head_map", "rope_half_tables", "fold_dims")
+           "head_map", "rope_half_tables", "fold_dims")
