@@ -1,0 +1,7 @@
+# The V-JEPA 2 study's environment (demo/video_classification/scripts/vjepa2_study.py;
+# doc/plans/VJEPA2_PLAN.md): the chat studies' .venv-export (numpy, torch, transformers,
+# safetensors) plus pyarrow, which reads the Something-Something v2 parquet file in `fetch`.
+#   PIP_CONFIG_FILE=/dev/null .venv-export/bin/pip install \
+#       --extra-index-url https://download.pytorch.org/whl/cpu -r demo/video_classification/scripts/requirements-study.txt
+-r ../../chat/scripts/requirements-study.txt
+pyarrow==22.0.0
