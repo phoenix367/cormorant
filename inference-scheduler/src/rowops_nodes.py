@@ -726,6 +726,29 @@ def rope_raw_tensor(tensors: dict, cos: np.ndarray, sin: np.ndarray) -> TensorIn
     return t
 
 
+def rope_ints_tensor(tensors: dict, cr: np.ndarray, sr: np.ndarray) -> TensorInfo:
+    """The cos / sin table of a ROPE job from its raw int24 values (2^-23)
+    per position and per element, [C][HD] each (a table of per-element angles —
+    V-JEPA 2's 3-D RoPE, src/vjepa2.py — that the float32 tables of
+    ``rope_raw_tensor`` could not carry exactly): one row per position of
+    cos[0..HD) then sin[0..HD) as int32, created on first use."""
+    import zlib
+    cr = np.asarray(cr, np.int64)
+    sr = np.asarray(sr, np.int64)
+    if cr.shape != sr.shape or cr.ndim != 2 or (np.abs(cr) > (1 << rs.ROPE_BITS)).any() \
+            or (np.abs(sr) > (1 << rs.ROPE_BITS)).any():
+        raise SchedulerError("rope_ints_tensor: two int24 tables [C][HD] at 2^-23")
+    rows = np.ascontiguousarray(np.concatenate([cr, sr], axis=1).astype(np.int32))      # [C][2 HD]
+    tag = zlib.crc32(rows.tobytes())
+    name = f"{ROPE_TABLE_PREFIX}_i{tag:08x}_{cr.shape[0]}x{cr.shape[1]}"
+    t = tensors.get(name)
+    if t is None:
+        words = rows.reshape(-1).view(np.int16).astype(np.int64)
+        t = TensorInfo(onnx_name=name, shape=[int(words.size)], dtype="float32", data=raw_as_data(words))
+        tensors[name] = t
+    return t
+
+
 def zero_param_tensor(tensors: dict) -> TensorInfo:
     """One all-zero P_BCAST entry: the plain copies and the zero fill."""
     t = tensors.get(ZERO_P_NAME)
@@ -1408,7 +1431,15 @@ class VitAttnPrepRoNode(RowOpsNode):
     (src/vit.py) the factory swaps q and k: k takes the image path (the x
     image of the scores conv) and q the K cache rows (its weight), so the
     scores come out query-major, s [T][C] — the same integer dot products —
-    for the softmax unit's row mode."""
+    for the softmax unit's row mode.
+
+    With the attribute ``rope`` (V-JEPA 2's 3-D RoPE, src/vjepa2.py) q and k
+    are rotated after their bias adds — vjepa2_q's irope: q0 + bq rounded at
+    the per-head bias exponents ``qbx`` into the staging rows ``sa``, a ROPE
+    (rowops_spec.rope; B = row t of the per-element cos / sin table, the head
+    dims in rotate-half order) into ``qs`` at f_q, the TRANSPOSE into the q
+    image; k0 + bk likewise into ``sa``, a ROPE into ``vs`` at f_k, one COPY
+    of ``vs`` into the K cache (the heads as blocks); then v as above."""
     T:  int = 1
     H:  int = 1
     HD: int = 16
@@ -1416,6 +1447,7 @@ class VitAttnPrepRoNode(RowOpsNode):
     K:  int = 1
     pq_bc: bool = False
     pv_bc: bool = False
+    rope: bool = False
     fq: Optional[np.ndarray] = field(default=None, repr=False)     # [H]
     fk: Optional[np.ndarray] = field(default=None, repr=False)     # [H]
     fv: Optional[np.ndarray] = field(default=None, repr=False)     # [D]
@@ -1435,13 +1467,27 @@ class VitAttnPrepRoNode(RowOpsNode):
     pz: object = field(default=None, repr=False)
     ekr: object = field(default=None, repr=False)   # Piper rel_kernel: raw key rows [CR][D] -> cache rows T ..
     CR: int = 0
+    # rope: the bias-add staging rows [T][D], the cos / sin table, the parameter blocks of
+    # k0 + bk (one of D columns), of the two ROPE jobs; the bias exponents [H]; the raw tables
+    sa:  object = field(default=None, repr=False)
+    raw: object = field(default=None, repr=False)
+    pk1: object = field(default=None, repr=False)
+    pqr: object = field(default=None, repr=False)
+    pkr: object = field(default=None, repr=False)
+    pk1_bc: bool = False
+    pqr_bc: bool = False
+    pkr_bc: bool = False
+    qbx: Optional[np.ndarray] = field(default=None, repr=False)
+    kbx: Optional[np.ndarray] = field(default=None, repr=False)
+    cr:  Optional[np.ndarray] = field(default=None, repr=False)     # [C][HD] int24 at 2^-23
+    sr:  Optional[np.ndarray] = field(default=None, repr=False)
 
     @property
     def D(self) -> int:
         return self.H * self.HD
 
     def state_writes(self):
-        return [self.ck, self.cv, self.qs, self.vs]
+        return [self.ck, self.cv, self.qs, self.vs] + ([self.sa] if self.rope else [])
 
     def state_updates(self):
         return self.state_writes()
@@ -1458,12 +1504,28 @@ class VitAttnPrepRoNode(RowOpsNode):
         SQ = SV = D * 2
         NW = NO_WINDOW
         xp = rs.opword(rs.OP_XPOSE)
-        jobs = [("q0 + bq at f_q[h] -> qs", self.q0, 0, None, 0, self.qs, 0, self.pq,
-                 rs.opword(rs.OP_COPY, p_bcast=self.pq_bc), D, T, 1, sq, 0, 0, 0, SQ, 0, 0, 0, NW),
-                ("qs -> the q.K^T x image of every head (8-row tiles, the heads as blocks)", self.qs, 0,
+        xpose = ("qs -> the q.K^T x image of every head (8-row tiles, the heads as blocks)", self.qs, 0,
                  None, 0, self.output, 0, None, xp, HD, T // QIMAGE_R, H, QIMAGE_R * SQ, HD * 2, SQ, 2 * T,
-                 2 * QIMAGE_R, HD * T * 2, QIMAGE_R, 0, NW)]
-        for h in range(H):
+                 2 * QIMAGE_R, HD * T * 2, QIMAGE_R, 0, NW)
+        if self.rope:
+            rp = rs.opword(rs.OP_ROPE, rs.K_I16, rs.K_I32, rs.K_I16, b_en=True)
+            jobs = [("q0 + bq at the bias exponents -> sa", self.q0, 0, None, 0, self.sa, 0, self.pq,
+                     rs.opword(rs.OP_COPY, p_bcast=self.pq_bc), D, T, 1, sq, 0, 0, 0, SQ, 0, 0, 0, NW),
+                    ("RoPE(sa) at f_q[h] -> qs (B = the cos / sin row of token t)", self.sa, 0, self.raw, 0,
+                     self.qs, 0, self.pqr, rp | (rs.F_P_BCAST if self.pqr_bc else 0), D, T, 1, SQ, 0, 8 * HD, 0,
+                     SQ, 0, HD, 0, NW),
+                    xpose,
+                    ("k0 + bk at the bias exponents -> sa", self.k0, 0, None, 0, self.sa, 0, self.pk1,
+                     rs.opword(rs.OP_COPY, p_bcast=self.pk1_bc), D, T, 1, sk, 0, 0, 0, SQ, 0, 0, 0, NW),
+                    ("RoPE(sa) at f_k[h] -> vs", self.sa, 0, self.raw, 0, self.vs, 0, self.pkr,
+                     rp | (rs.F_P_BCAST if self.pkr_bc else 0), D, T, 1, SQ, 0, 8 * HD, 0, SV, 0, HD, 0, NW),
+                    ("vs -> the K cache rows (the heads as blocks)", self.vs, 0, None, 0, self.ck, 0, self.pz,
+                     rs.opword(rs.OP_COPY, p_bcast=True), HD, T, H, SV, HD * 2, 0, 0, HD * 2, C * HD * 2, 0, 0,
+                     NW)]
+        else:
+            jobs = [("q0 + bq at f_q[h] -> qs", self.q0, 0, None, 0, self.qs, 0, self.pq,
+                     rs.opword(rs.OP_COPY, p_bcast=self.pq_bc), D, T, 1, sq, 0, 0, 0, SQ, 0, 0, 0, NW), xpose]
+        for h in range(H if not self.rope else 0):
             jobs.append((f"k0 + bk of head {h} at f_k -> the K cache", self.k0, h * HD * 2, None, 0, self.ck,
                          h * C * HD * 2, self.pk[h], rs.opword(rs.OP_COPY), HD, T, 1, sk, 0, 0, 0, HD * 2, 0,
                          0, 0, NW))
@@ -1523,6 +1585,13 @@ class VitAttnPrepRoNode(RowOpsNode):
         raw = lambda t: np.rint(np.asarray(a[t.onnx_name], np.float64).reshape(T, D)   # noqa: E731
                                 * p2(_exps(t, F))[None, :]).astype(np.int64)
         ck, cv = a[self.ck.onnx_name], a[self.cv.onnx_name]       # logical state arrays (raw), in place
+        if self.rope:
+            def roped(x, b, fb, fo):
+                xb = rs.bias_round(raw(x), _exps(x, F), b, np.repeat(fb, HD))
+                return rs.rope(xb.reshape(T, H, HD), fb, self.cr[:T], self.sr[:T], fo)
+            ck[:T] = roped(self.k0, self.bk, self.kbx, self.fk).reshape(T, D)
+            cv[:T] = rs.bias_round(raw(self.v), _exps(self.v, F), self.bv, self.fv)
+            return roped(self.q0, self.bq, self.qbx, self.fq).astype(np.float64).transpose(1, 2, 0).copy()
         ck[:T] = rs.bias_round(raw(self.k0), _exps(self.k0, F), self.bk, np.repeat(self.fk, HD))
         if self.CR:                                              # the key rows' Q8.8 image, raw
             ck[T:T + self.CR] = np.rint(np.asarray(a[self.ekr.onnx_name], np.float64).reshape(self.CR, D)
@@ -1536,18 +1605,21 @@ def from_vit_attn_prep(node, tensors, index, align_elems, ctx: HostContext):
     """VitAttnPrep: VitAttnPrepRoNode with the attribute rowops = 1 (src/vit.py /
     src/piper.py rowops=True), else the host op."""
     from .host_nodes import _attrs
-    from .llm_nodes import _attr_ints, _llm_inputs, _resolve
+    from .llm_nodes import _attr_ints, _const_array, _llm_inputs, _resolve
     from .vit_nodes import VitAttnPrepNode, _bias
     if not _rowops_attr(node):
         return VitAttnPrepNode.from_onnx_node(node, tensors, index, align_elems, ctx)
     _need_unit(node, "rowops = 1")
     F = ctx.frac_bits
     ins = _llm_inputs(node, tensors)
-    _require(len(ins) in (10, 11), node, "inputs: q0, k0, v, cache_k, cache_v, bq, bk, bv, qs, vs[, key_rows]")
+    _require(len(ins) in (10, 11, 14), node, "inputs: q0, k0, v, cache_k, cache_v, bq, bk, bv, qs, vs[, key_rows"
+                                             "[, cos, sin, sa]] (key_rows may be empty)")
     q0, k0, v, ck, cv, _bq, _bk, _bv, qs, vs = ins[:10]
-    ekr = ins[10] if len(ins) == 11 else None
+    ekr = ins[10] if len(ins) >= 11 else None
     y = _resolve(tensors, node.output[0], node)
     a = _attrs(node)
+    rope = int(a.get("rope", 0)) != 0
+    _require(rope == (len(ins) == 14), node, "rope = 1 takes the inputs cos, sin, sa (and only it)")
     H, HD = int(a["num_heads"]), int(a["head_dim"])
     C = int(ck.shape[0])
     D = H * HD
@@ -1583,29 +1655,61 @@ def from_vit_attn_prep(node, tensors, index, align_elems, ctx: HostContext):
     fk = np.asarray(_attr_ints(a, "k_exp", node, H), np.int64)
     fv = np.asarray(_attr_ints(a, "v_exp", node, D), np.int64)
     bq, bk, bv = (_bias(ctx, tensors, node, i, D, w) for i, w in ((5, "bq"), (6, "bk"), (7, "bv")))
+    qbx = kbx = cr = sr = sa = None
+    if rope:
+        _require(ekr is None, node, "rope with key rows (Piper's rel_kernel)")
+        _require(HD <= 128, node, f"rope: head_dim {HD} (the unit's ROPE takes 16 .. 128)")
+        qbx = np.asarray(_attr_ints(a, "qb_exp", node, H), np.int64)
+        kbx = np.asarray(_attr_ints(a, "kb_exp", node, H), np.int64)
+        tab = [np.asarray(_const_array(ctx, tensors, node.input[i], node, w), np.float64) for i, w in
+               ((11, "cos"), (12, "sin"))]
+        _require(all(t.size == C * HD and (np.rint(t) == t).all() and (np.abs(t) <= 2 ** rs.ROPE_BITS).all()
+                     for t in tab), node, f"cos / sin: [{C}][{HD}] raw int24 values at 2^-{rs.ROPE_BITS}")
+        cr, sr = (np.rint(t).astype(np.int64).reshape(C, HD) for t in tab)
+        sa = ins[13]
+        _require(sa is not None and sa.is_state and not sa.is_host and sa.dma is None and list(sa.shape) == [T, D],
+                 node, f"sa: an int16 DMA state [{T}][{D}]")
     if int(a.get("query_major", 0)):
         # the scores query-major: k takes the image path, q the cache rows (T == C: the jobs are symmetric)
         _require(ekr is None, node, "query_major with key rows (Piper's rel_kernel)")
-        q0, k0, bq, bk, fq, fk = k0, q0, bk, bq, fk, fq
+        q0, k0, bq, bk, fq, fk, qbx, kbx = k0, q0, bk, bq, fk, fq, kbx, qbx
     try:
-        bqq, saq, scq = rs.bias_params(bq, _exps(q0, F), np.repeat(fq, HD))
-        bkq, sak, sck = rs.bias_params(bk, _exps(k0, F), np.repeat(fk, HD))
+        # rope: the bias adds round at the bias exponents (the ROPE jobs' inputs)
+        bqq, saq, scq = rs.bias_params(bq, _exps(q0, F), np.repeat(qbx if rope else fq, HD))
+        bkq, sak, sck = rs.bias_params(bk, _exps(k0, F), np.repeat(kbx if rope else fk, HD))
         bvq, sav, scv = rs.bias_params(bv, _exps(v, F), fv)
     except ValueError as e:
         raise SchedulerError(f"{node.op_type} node '{_label(node)}': {e}") from None
     _require((saq <= 63).all() and (sak <= 63).all() and (sav <= 63).all(), node, "exponents beyond the shifts")
     pq, pq_bc = _pblock(tensors, f"{y.onnx_name}__rowops_pq", 0, bqq, saq, 0, scq, D)
-    pk = [param_tensor(tensors, f"{y.onnx_name}__rowops_pk{h}",
-                       rs.param_block(np.zeros(HD, np.int64), bkq[h * HD:(h + 1) * HD], sak[h * HD:(h + 1) * HD],
-                                      0, sck[h * HD:(h + 1) * HD])) for h in range(H)]
     pvb, pv_bc = _pblock(tensors, f"{y.onnx_name}__rowops_pv", 0, bvq, sav, 0, scv, D)
     pz = zero_param_tensor(tensors)
     tb = tables_tensor(tensors)
-    return VitAttnPrepRoNode(onnx_node=node, inputs=[q0, k0, v, ck, cv, qs, vs, pq, *pk, pvb, pz, tb]
+    extra = {}
+    if rope:
+        def rope_p(fb, fo, what):     # rowops_spec.rope with one exponent per head on both sides
+            sc = np.repeat(np.asarray(fb, np.int64) + rs.ROPE_BITS - np.asarray(fo, np.int64), HD)
+            _require((sc >= 0).all() and (sc <= 63).all(), node, f"{what}: RoPE exponents beyond the shifts")
+            return _pblock(tensors, f"{y.onnx_name}__rowops_{what}", 0, 0, 0, 0, sc, D)
+        pk1, pk1_bc = _pblock(tensors, f"{y.onnx_name}__rowops_pk1", 0, bkq, sak, 0, sck, D)
+        pqr, pqr_bc = rope_p(qbx, fq, "pqr")
+        pkr, pkr_bc = rope_p(kbx, fk, "pkr")
+        raw = rope_ints_tensor(tensors, cr, sr)
+        params = [pq, pk1, pqr, pkr, pvb, pz, raw, tb]
+        extra = dict(rope=True, sa=sa, raw=raw, pk1=pk1, pqr=pqr, pkr=pkr, pk1_bc=pk1_bc, pqr_bc=pqr_bc,
+                     pkr_bc=pkr_bc, qbx=qbx, kbx=kbx, cr=cr, sr=sr)
+        pk = []
+    else:
+        pk = [param_tensor(tensors, f"{y.onnx_name}__rowops_pk{h}",
+                           rs.param_block(np.zeros(HD, np.int64), bkq[h * HD:(h + 1) * HD],
+                                          sak[h * HD:(h + 1) * HD], 0, sck[h * HD:(h + 1) * HD]))
+              for h in range(H)]
+        params = [pq, *pk, pvb, pz, tb]
+    return VitAttnPrepRoNode(onnx_node=node, inputs=[q0, k0, v, ck, cv, qs, vs] + ([sa] if rope else []) + params
                              + ([ekr] if ekr is not None else []), output=y,
                              index=index, align_elems=align_elems, F=F, T=T, H=H, HD=HD, C=C, K=K,
                              pq_bc=pq_bc, pv_bc=pv_bc, fq=fq, fk=fk, fv=fv, bq=bq, bk=bk, bv=bv, q0=q0, k0=k0,
-                             v=v, ck=ck, cv=cv, qs=qs, vs=vs, pq=pq, pk=pk, pvb=pvb, pz=pz, ekr=ekr, CR=CR)
+                             v=v, ck=ck, cv=cv, qs=qs, vs=vs, pq=pq, pk=pk, pvb=pvb, pz=pz, ekr=ekr, CR=CR, **extra)
 
 
 VIT_OVERRIDES = {

@@ -30,6 +30,7 @@ speech-to-text library of its `moonshine` backend.
 | [`asr/`](asr/) | Moonshine base / tiny (UsefulSensors) | LibriSpeech test-clean utterances, your WAV files (through the chat server) | The numeric study, `libmoonshine_<size>.so` (the encoder and the greedy decoder on the FPGA, a 10 s recording in 1.3 s through the server) and its board gate: every token id bit-exact with the specification, WER 2.93 % (base); the library serves the chat server's `moonshine` backend |
 | [`miranda/`](miranda/) | Moonshine base, SmolLM2-360M-Instruct, Piper lessac-medium (through the chat server) | the microphone (RTP from a console client) | A voice assistant: "Hello Miranda" and a request; voice activity detection on the board's CPU, the key phrase found in the transcripts, the answer streamed as text and spoken back; the microphone muted while Miranda thinks and speaks; a dialogue mode without the key phrase (by voice, `--dialogue` or `d` + Enter) that ends after silence |
 | [`vla/`](vla/) | SmolVLA (lerobot/smolvla_base) | 1–3 camera frames, a task, the robot's state | Vision-language-action: 50 actions per chunk (3.96 s from two cameras); the study, the bit-level specification, `libsmolvla.so` (with a ctypes wrapper) and its host-emulation and board gates (actions bit-exact with the specification) |
+| [`video_classification/`](video_classification/) | V-JEPA 2 ViT-L SSv2 classifier (facebook/vjepa2-vitl-fpc16-256-ssv2) | decoded videos (16 of the first 64 frames) | Action recognition over Something-Something v2's 174 classes (13.8 s per video on bitstream `b4e63457057a`, accuracy equal to float's on 100 clips); the study, the bit-level specification, `libvjepa2.so` (with a ctypes wrapper) and its simulation, host-emulation and board gates (logits bit-exact with the specification) |
 
 ## Models
 
@@ -57,6 +58,7 @@ own models.
 | Piper en_US-lessac-medium ([rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) ONNX) | text, up to 4096 characters (espeak-ng phonemes) | text to speech ([demo/tts](tts/README.md), [demo/chat](chat/doc/TEXT_TO_SPEECH.md)) |
 | Moonshine base / tiny ([UsefulSensors/moonshine-base](https://huggingface.co/UsefulSensors/moonshine-base), safetensors) | 16 kHz audio, any length (parts of up to 24.6 s) | speech to text ([demo/asr](asr/scripts/), [demo/chat](chat/doc/SPEECH_TO_TEXT.md)) |
 | SmolVLA ([lerobot/smolvla_base](https://huggingface.co/lerobot/smolvla_base), safetensors) | 1–3 camera frames (any size), a task's tokens, the robot's state | robot actions: a chunk of 50 ([demo/vla](vla/README.md)) |
+| V-JEPA 2 ViT-L SSv2 ([facebook/vjepa2-vitl-fpc16-256-ssv2](https://huggingface.co/facebook/vjepa2-vitl-fpc16-256-ssv2), safetensors) | a decoded video (any size; 16 frames at 256×256 = 2048 tokens) | action recognition: Something-Something v2's 174 classes ([demo/video_classification](video_classification/README.md)) |
 
 ## Common workflow
 

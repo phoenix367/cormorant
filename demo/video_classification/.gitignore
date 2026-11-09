@@ -1,2 +1,4 @@
 # The checkpoint, the Something-Something v2 videos, the study results (a link to /mnt/data): not in git
 assets
+# The generated project (generate_vjepa2_project.py)
+build

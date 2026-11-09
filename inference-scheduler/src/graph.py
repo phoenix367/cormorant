@@ -48,6 +48,7 @@ from .tts_nodes import TTS_OP_FACTORIES
 from .stereo_nodes import STEREO_OP_FACTORIES
 from .asr_nodes import ASR_OP_FACTORIES
 from .vla_nodes import VLA_OP_FACTORIES
+from .vjepa2_nodes import VJ_OP_FACTORIES
 from . import cost_model
 from . import fusion
 from . import matmul_lowering
@@ -804,6 +805,7 @@ class OnnxGraph:
             if node.domain == LLM_DOMAIN:
                 factories = {**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES,
                              **STEREO_OP_FACTORIES, **ASR_OP_FACTORIES, **VLA_OP_FACTORIES,
+                             **VJ_OP_FACTORIES,
                              **rowops_nodes.LLM_OVERRIDES, **rowops_nodes.VIT_OVERRIDES,
                              **rowops_nodes.TTS_OVERRIDES}
                 if node.op_type not in factories:

@@ -134,21 +134,42 @@ def sample_frames(n, fpc=16, step=4):
     return np.clip(idx, 0, sample_len - 1).astype(np.int64)
 
 
-def _resample_matrix(n_in, n_out):
-    """[n_out, n_in] weights of PIL's bilinear resample (the triangle filter, its
-    support widened by the downscale factor: antialiased)."""
+def resample_taps(n_in, n_out):
+    """PIL's bilinear resample (the triangle filter, its support widened by the downscale
+    factor: antialiased) as taps: (lo [n_out], W [n_out][taps]) — output i is
+    sum_j W[i][j] x[lo[i] + j], the weights normalised by their sum taken left to right,
+    zero past the filter.  Every operation is the C library's (vjepa2_api.c), in order."""
     scale = n_in / n_out
     fs = max(scale, 1.0)
     support = fs
-    M = np.zeros((n_out, n_in))
+    lo, ws = np.zeros(n_out, np.int64), []
     for i in range(n_out):
         c = (i + 0.5) * scale
-        lo = max(int(c - support + 0.5), 0)
-        hi = min(int(c + support + 0.5), n_in)
-        x = (np.arange(lo, hi) - c + 0.5) / fs
-        w = np.maximum(0.0, 1.0 - np.abs(x))
-        M[i, lo:hi] = w / w.sum()
-    return M
+        a = max(int(c - support + 0.5), 0)
+        b = min(int(c + support + 0.5), n_in)
+        w = np.maximum(0.0, 1.0 - np.abs((np.arange(a, b) - c + 0.5) / fs))
+        tot = 0.0
+        for v in w:
+            tot += float(v)
+        lo[i] = a
+        ws.append(w / tot)
+    W = np.zeros((n_out, max(len(w) for w in ws)))
+    for i, w in enumerate(ws):
+        W[i, :len(w)] = w
+    return lo, W
+
+
+def _resample(x, n_out, axis):
+    """One pass along ``axis`` of float64 x: the taps summed left to right (the C
+    library's order — a BLAS product's is not portable), floor(v + 0.5), clipped to [0, 255]."""
+    lo, W = resample_taps(x.shape[axis], n_out)
+    xm = np.moveaxis(x, axis, 0)
+    idx = np.minimum(lo[:, None] + np.arange(W.shape[1])[None, :], xm.shape[0] - 1)   # zero weights past the end
+    shp = (n_out,) + (1,) * (xm.ndim - 1)
+    acc = W[:, 0].reshape(shp) * xm[idx[:, 0]]
+    for j in range(1, W.shape[1]):
+        acc = acc + W[:, j].reshape(shp) * xm[idx[:, j]]
+    return np.moveaxis(np.clip(np.floor(acc + 0.5), 0, 255), 0, axis)
 
 
 def resize_short(img, short):
@@ -162,9 +183,9 @@ def resize_short(img, short):
         oh, ow = int(short * h / w), short
     x = img.astype(np.float64)
     if ow != w:
-        x = np.clip(np.floor(np.matmul(_resample_matrix(w, ow), x) + 0.5), 0, 255)          # [h, ow, 3]
+        x = _resample(x, ow, 1)                                     # [h, ow, 3]
     if oh != h:
-        x = np.clip(np.floor(np.tensordot(_resample_matrix(h, oh), x, axes=(1, 0)) + 0.5), 0, 255)
+        x = _resample(x, oh, 0)
     return x.astype(np.uint8)
 
 
@@ -214,6 +235,16 @@ def kernel_weights(W, cfg):
     KW[(0, "pe")] = patch_weight(W, cfg)[0]
     KW[(cfg.lk, "cls")] = np.ascontiguousarray(W["classifier.weight"].T)
     return KW
+
+
+def cross_query(W, cfg):
+    """The cross layer's q = query . Wq^T + bq in double [D]: each output a correctly
+    rounded sum of the exact products (math.fsum — the same on every machine, unlike a
+    BLAS dot product; src/vjepa2.py cross_query) plus the bias."""
+    query = W[POOL + "query_tokens"].reshape(-1).astype(np.float64)
+    cq = POOL + "cross_attention_layer.cross_attn.q_proj."
+    Wq, bq = W[cq + "weight"].astype(np.float64), W[cq + "bias"].astype(np.float64)
+    return np.array([math.fsum(query * Wq[j]) for j in range(Wq.shape[0])]) + bq
 
 
 # ------------------------------------------------------------------ RoPE
@@ -316,11 +347,8 @@ class VJEPA2(vs.VisionModel):
         self.lnf = (g(ENC + "layernorm.weight"), g(ENC + "layernorm.bias"))
         self.b[(cfg.lk, "cls")] = g("classifier.bias")
         self.query = W[POOL + "query_tokens"].reshape(1, cfg.D).astype(np.float64)
-        # the cross layer's query projection: a constant of the model (double: the
-        # frontend's initializer)
-        cq = POOL + "cross_attention_layer.cross_attn.q_proj."
-        Wq, bq = W[cq + "weight"].astype(np.float64), W[cq + "bias"].astype(np.float64)
-        self.qc = self.query @ Wq.T + bq
+        # the cross layer's query projection: a constant of the model (the frontend's)
+        self.qc = cross_query(W, cfg)[None, :]
         self.b0 = patch_weight(W, cfg, exact=not self.q)[1].astype(np.float64)
         KW = kernel_weights(W, cfg) if KW is None else KW
         self.w = {k: self._enc(Wk, k[0], k[1], *self._io(k[1])) for k, Wk in KW.items()}

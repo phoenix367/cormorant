@@ -436,7 +436,8 @@ class VitAttnSoftmaxNode(VitNode):
     """s [C][T] raw scores (at f_s) -> P [T][C] raw at 2^-f_p, every key; with
     the ``cols`` attribute [c0, n] only the query columns c0 .. c0 + n - 1
     -> P [n][C] (one part of a softmax split by query rows,
-    TACTICS_PLAN §4.4)."""
+    TACTICS_PLAN §4.4).  ``query_major`` scores are s [T][C] (a row per query;
+    vsmx only) — T may differ from C: a row piece of the queries (src/vjepa2.py)."""
     T:     int = 1
     C:     int = 16
     scale: float = 1.0
@@ -451,6 +452,8 @@ class VitAttnSoftmaxNode(VitNode):
         y = _resolve(tensors, node.output[0], node)
         a = _attrs(node)
         C, T = int(s.shape[0]), int(s.shape[1])
+        if int(a.get("query_major", 0)):                 # s [T][C]: the rows are the queries
+            T, C = C, T
         c0, nc = (_attr_ints(a, "cols", node, 2) if "cols" in a else (0, T))
         _require(0 <= c0 and 0 < nc and c0 + nc <= T, node, f"cols [{c0}, {nc}] outside {T}")
         _require(len(s.shape) == 2 and list(y.shape) == [nc, C], node,

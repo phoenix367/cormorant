@@ -22,12 +22,16 @@ route C; doc/plans/VJEPA2_PLAN.md).  Host only.
             value ranges, saturation, accumulators -> study/results.json
   ablate    the planned policy with one group of tensor classes quantised (the others exact)
   costs     MACs and int16 weight bytes per part, the projected board time
+  formats   the calibrated exponents of a policy (the 16 calibration clips; default the planned
+            one) -> demo/video_classification/vjepa2_vitl_ssv2_<policy>_formats.json, the
+            frontend's (inference-scheduler/src/vjepa2.py) — byte-identical on a rerun
 
 usage (.venv-export with pyarrow: demo/video_classification/scripts/requirements-study.txt):
   PY=.venv-export/bin/python
   $PY demo/video_classification/scripts/vjepa2_study.py fetch [--record]
   $PY demo/video_classification/scripts/vjepa2_study.py validate
   $PY demo/video_classification/scripts/vjepa2_study.py study [--policies a,b] [--quick | -n N]
+  $PY demo/video_classification/scripts/vjepa2_study.py formats [--policy P]
 
 Assets (not in git, demo/video_classification/assets -> /mnt/data/vjepa2_assets):
 vjepa2-vitl-fpc16-256-ssv2/, datasets/ssv2_mteb/, videos/, samples/, study/.
@@ -42,7 +46,7 @@ import subprocess
 import sys
 import time
 
-if any(c in sys.argv for c in ("study", "ablate")):     # one BLAS thread per worker process
+if any(c in sys.argv for c in ("study", "ablate", "formats")):     # one BLAS thread per worker process
     for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(_v, "1")
 
@@ -451,6 +455,24 @@ def cmd_ablate(args):
               f"logits rel {mt['logits']['mean']:.4f}  encoder rel {mt['xf']['mean']:.4f}", flush=True)
 
 
+# ------------------------------------------------------------------ formats
+def formats_path(policy):
+    return os.path.normpath(os.path.join(HERE, "..", f"vjepa2_vitl_ssv2_{policy}_formats.json"))
+
+
+def cmd_formats(args):
+    cfg, W, KW = load_model_inputs(args.assets)
+    ch = calibrate(cfg, W, KW, args.assets, args.jobs, print)
+    pol = vq.POLICIES[args.policy]
+    fmt = vq.make_formats(pol, ch, KW, cfg)
+    d = vq.formats_json(fmt, args.policy, pol)
+    d["checkpoint"] = inputs()["model"]
+    path = formats_path(args.policy)
+    with open(path, "w") as f:
+        json.dump(d, f)
+    print(f"{path}: {len(fmt)} entries")
+
+
 # ------------------------------------------------------------------ costs
 # board references (bitstream b4e63457057a's design): SmolVLA's vision entry (SigLIP, 12 layers 768
 # wide, 1024 tokens, the same partition: query-major scores, the row-mode softmax, two row pieces)
@@ -488,11 +510,12 @@ def cmd_costs(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("cmd", choices=["fetch", "validate", "study", "ablate", "costs"])
+    ap.add_argument("cmd", choices=["fetch", "validate", "study", "ablate", "costs", "formats"])
     ap.add_argument("--assets", default=ASSETS)
     ap.add_argument("--record", action="store_true", help="fetch: record the hashes and the sample selection")
     ap.add_argument("--policies", default=None, help="study: comma-separated (default: every vjepa2_q.POLICIES)")
     ap.add_argument("--base", default=PLANNED, help="ablate: the policy")
+    ap.add_argument("--policy", default=PLANNED, help="formats: the policy")
     ap.add_argument("--quick", action="store_true", help="study: 16 evaluation clips")
     ap.add_argument("-n", type=int, default=100, help="validate / study / ablate: evaluation clips")
     ap.add_argument("--jobs", type=int, default=4)
@@ -501,7 +524,7 @@ def main():
     if args.cmd == "validate" and "-n" not in sys.argv:
         args.n = 3
     {"fetch": cmd_fetch, "validate": cmd_validate, "study": cmd_study, "ablate": cmd_ablate,
-     "costs": cmd_costs}[args.cmd](args)
+     "costs": cmd_costs, "formats": cmd_formats}[args.cmd](args)
 
 
 if __name__ == "__main__":

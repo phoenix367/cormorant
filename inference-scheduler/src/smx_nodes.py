@@ -227,7 +227,7 @@ class VitAttnSoftmaxVopNode(SmxVopNode):
         _require(C <= (smx.MAX_ROW if qm else smx.MAX_KEYS), node,
                  f"{C} keys (the unit takes {smx.MAX_ROW if qm else smx.MAX_KEYS})")
         if qm:
-            _require(T == C and C % 8 == 0, node, f"query-major scores [{T}][{C}]: square, 16-byte aligned rows")
+            _require(C % 8 == 0, node, f"query-major scores [{T}][{C}]: 16-byte aligned rows")
         else:
             _require(nc % COL_BLOCK == 0 and c0 % 8 == 0 and T % 8 == 0 and C % 8 == 0, node,
                      f"columns [{c0}, {nc}] of {T}, {C} keys: the unit takes blocks of "

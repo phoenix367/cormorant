@@ -1202,7 +1202,10 @@ class LlmAttnConvNode(LlmKernelNode):
     Both write floor(sum / 2^8) saturated (ap_fixed<32,16> accumulator), raw
     integers.  inputs = [weight, x, pos, n]; the geometry (kw, out_h, out_w)
     is fixed at codegen by the cost model.  inputs = [weight, x] (a vision
-    encoder, src/vit.py): a static key count, keys = C."""
+    encoder, src/vit.py): a static key count, keys = C.  A static q.K^T with
+    the attribute ``rows`` [r0, n] reads only the cache rows r0 .. r0 + n - 1
+    (out_ch = n) into scores [n][G*T]: query-major scores in row pieces, each
+    within ConvKernel's out_ch bound (V-JEPA 2's 2048 tokens, src/vjepa2.py)."""
 
     kernel_name: ClassVar[str] = "ConvKernel"
     is_llm_op:   ClassVar[bool] = True
@@ -1227,6 +1230,8 @@ class LlmAttnConvNode(LlmKernelNode):
     est_cycles:  Tuple = ()           # ((keys, conv cycles, MatmulKernel cycles), ...)
     static:      bool = False         # no pos / n: keys = C
     has_n:       bool = True          # False: a decode step, n = T
+    r0:          int = 0              # static q.K^T: the first cache row (attribute rows)
+    nr:          int = 0              # ... and their count (0: all C)
     # set by the code generator (CodeGenerator._merge_in_place): a P.V call that
     # writes its rows straight into the merged tensor through ConvKernel's y
     # channel pattern, (y_cs, y_cn, y_gs) — RPU_PLAN §13.2; None = dense
@@ -1265,11 +1270,16 @@ class LlmAttnConvNode(LlmKernelNode):
                  "the cache must be a DMA state stored group-major")
         Q = int(a.get("key_quantum", KEY_QUANTUM))
         _require(C % Q == 0 and Q % KEY_QUANTUM == 0, node, f"cache rows {C} % key_quantum {Q}")
+        r0, nr = 0, 0
+        if "rows" in a:
+            _require(static and kind == "qk", node, "rows: a static q.K^T only")
+            r0, nr = _attr_ints(a, "rows", node, 2)
+            _require(0 <= r0 and 0 < nr and r0 + nr <= C, node, f"rows [{r0}, {nr}] outside the {C} cache rows")
         if kind == "qk":
             T = x.numel // (KV * HD * G)
             kw = int(a.get("qk_kw", 1))
             _require(list(x.shape) == [KV, HD, G * T], node, "qx shape")
-            _require(list(y.shape) == [C, G * T], node, f"scores must be [{C}][{G * T}]")
+            _require(list(y.shape) == [nr or C, G * T], node, f"scores must be [{nr or C}][{G * T}]")
             M = G * T
         else:
             T = w.numel // (G * C)
@@ -1282,17 +1292,17 @@ class LlmAttnConvNode(LlmKernelNode):
             _require(HD % (16 * kw) == 0, node, f"head_dim % (16 * kw {kw})")
             _require(w.group_kw == 1, node, "the K cache rows must not be interleaved")
         # ConvKernel bounds at the largest runtime extent (keys = C)
-        out_ch_max = C if kind == "qk" else G * T
+        out_ch_max = (nr or C) if kind == "qk" else G * T
         in_ch_max = HD // kw if kind == "qk" else C // kw
         _require(out_ch_max <= CONV_MAX_OUT_CH and in_ch_max <= CONV_MAX_IN_CH, node,
                  f"out_ch {out_ch_max} / in_ch {in_ch_max} beyond ConvKernel's bounds")
         m_pad = -(-out_ch_max // 16) * 16
-        oh, ow, est = cls._plan(kind, T, G, HD, C, kw, M, m_pad, CONV_MAX_ACC_PERSIST_ENTRIES, Q,
+        oh, ow, est = cls._plan(kind, T, G, HD, nr or C, kw, M, m_pad, CONV_MAX_ACC_PERSIST_ENTRIES, Q,
                                 static)
         sn = cls(onnx_node=node, inputs=[w, x] if static else [w, x, pos] + ([n] if n is not None else []),
                  output=y, index=index, align_elems=align_elems, kind=kind, group=g, T=T, H=H,
                  KV=KV, HD=HD, C=C, kw=kw, out_h=oh, out_w=ow, Q=Q, F=ctx.frac_bits, est_cycles=est,
-                 static=static, has_n=n is not None)
+                 static=static, has_n=n is not None, r0=r0, nr=nr)
         for t, what in (() if static else ((pos, "pos"), (n, "n"))):
             _require(t is None or t.host == "i32", node, f"{what} must be an i32 host tensor")
         for t in ((x, y) if kind == "qk" else (w, y)):
@@ -1351,14 +1361,15 @@ class LlmAttnConvNode(LlmKernelNode):
                     f" in_ch=keys/{self.kw} 1x{self.kw} out {self.out_h}x{self.out_w}")
         return (f"    /* [{self.index}] {self.onnx_node.op_type}({w}, {x}) -> "
                 f"{self.output.onnx_name}  {what}; "
-                + (f"keys = {self.C} */" if self.static else
+                + ((f"keys = {self.nr} (cache rows {self.r0} ..) */" if self.nr else f"keys = {self.C} */")
+                   if self.static else
                    f"keys = roundup(pos + n, {self.Q}) at run time */"))
 
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
         w, x = self.inputs[:2]
         GTHD = self.G * self.T * self.HD
         if self.kind == "qk":
-            xo, wo = self.group * GTHD, self.group * self.C * self.HD
+            xo, wo = self.group * GTHD, (self.group * self.C + self.r0) * self.HD
         else:
             xo, wo = self.group * self.C * self.HD, 0
         fn, pat = "run_conv_at", ""
@@ -1367,7 +1378,7 @@ class LlmAttnConvNode(LlmKernelNode):
         if self.static:
             return "\n".join([
                 f"    {fn}({x.c_name}, {xo}u, {w.c_name}, {wo}u, {self.output.c_name}, 0u,",
-                f"                {self.conv_regs(f'{self.C}u')}{pat});"])
+                f"                {self.conv_regs(f'{self.nr or self.C}u')}{pat});"])
         pos = self.inputs[2]
         n = f"(unsigned){self.inputs[3].c_name}[0]" if self.has_n else f"{self.T}u"
         return "\n".join([
@@ -1384,7 +1395,7 @@ class LlmAttnConvNode(LlmKernelNode):
         keys: the static count, or for a runtime count the one given (default
         the cache size C, the most a call reads)."""
         from .perf_calls import KernelCall
-        keys = self.C if (self.static or keys is None) else int(keys)
+        keys = (self.nr or self.C) if (self.static or keys is None) else int(keys)
         geo = dict(batch=1, in_h=self.out_h, in_w=self.kw * self.out_w, out_h=self.out_h,
                    out_w=self.out_w, kh=1, kw=self.kw, stride_h=1, stride_w=self.kw,
                    dilation_h=1, dilation_w=1)
@@ -1399,6 +1410,9 @@ class LlmAttnConvNode(LlmKernelNode):
                                                     self.T, self.C, self.Q)[1]
         g, HD, F = self.group, self.HD, self.F
         if self.kind == "qk":
+            if self.nr:                                                      # the cache rows r0 .. r0 + nr
+                kc = _raw(self.inputs[0], w, F)[self.r0:self.r0 + self.nr, g * HD:(g + 1) * HD]
+                return _kernel_out(kc @ np.asarray(x, np.float64)[g], F)
             kc = _raw(self.inputs[0], w, F)[:keys, g * HD:(g + 1) * HD]     # [keys][HD]
             B = np.asarray(x, np.float64)[g]                                 # [HD][G*T] raw
             out = np.zeros((self.C, self.G * self.T))

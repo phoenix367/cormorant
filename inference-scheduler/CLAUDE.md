@@ -270,6 +270,11 @@ src/
                          cross K / V states) and the decode entry (doc/plans/ASR_PLAN.md)
   asr_nodes.py           its ops: AsrFrames / AsrStemNorm / AsrStemGelu / AsrFrameCount / AsrArgmax
                          (host) and AsrCrossPrep / AsrCrossQ / AsrSwiGLU (row-ops nodes) + ASR_C
+  vjepa2.py              V-JEPA 2 video-classifier frontend: config + checkpoint + calibrated formats -> the clip
+                         entry (3-D RoPE on the row-ops unit, query parts of the 2048-token attention,
+                         the attentive pooler; ../doc/plans/VJEPA2_PLAN.md)
+  vjepa2_nodes.py        its ops: VjResCopy (row-ops COPY into / out of the int32 residual), VjCrossAttn
+                         (the pooler's one-row cross attention, host), VjLogits (host) + VJ_C
   numeric.py             axi.numeric metadata: power-of-two exponents (MatMul and Conv weight
                          encoding; chexp: per-channel Conv exponents), host tensors, states
   fusion.py              Constant folding, Split lowering, LayerNorm / GELU fusion,
@@ -354,7 +359,7 @@ test/
                          VectorOP / Matmul / Conv / RowOps kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              93 pytest modules, 1934 tests, all pass (test_bert_base.py
+  test_*.py              94 pytest modules, 1940 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -371,6 +376,9 @@ test/
                          buckets, host_emu; the C duration predictor == its spec),
                          test_stereo_nodes.py / test_stereo.py (the stereo ops, the
                          LightStereo frontend on host_emu),
+                         test_vjepa2.py (the V-JEPA 2 clip entry == the specification
+                         demo/video_classification/scripts/vjepa2_q.py, host_emu; the library
+                         demo/video_classification/src/vjepa2_api.c on host_emu),
                          test_moonshine.py (the Moonshine entries == the specification
                          demo/asr/scripts/moonshine_q.py, host_emu; the library
                          demo/asr/src/asr_api.c on host_emu == transcribe_long),

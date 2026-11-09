@@ -95,7 +95,7 @@ kernel implements (LayerNorm / GELU subgraphs, `Concat`, `Resize`, `Gather`, …
 host ops, and overlaps kernels on different lanes with pool slots shared by
 liveness.  Frontends write the graphs of models ONNX does not carry well — Llama-family
 and Gemma 3 decoders with their KV caches, a ViT vision encoder, Piper (VITS) text to
-speech, Moonshine speech to text, SmolVLA, LightStereo-S — with per-tensor
+speech, Moonshine speech to text, SmolVLA, V-JEPA 2, LightStereo-S — with per-tensor
 power-of-two exponents instead of the fixed `ap_fixed<16,8>` (8 fractional bits).
 An optional planner (`--plan`) picks MatMul tactics and the issue order from the
 bitstream's measured performance model.  Reference:
@@ -135,7 +135,7 @@ BLAS) and `TestMatmulRtl TestVectorOpRtl TestPoolRtl TestConvRtl TestRowOpsRtl`
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1934 tests (the first run downloads the 435 MB BERT model)
+.venv/bin/python -m pytest test/ -q              # 1940 tests (the first run downloads the 435 MB BERT model)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 python3 ../tools/facts/facts.py install-hook     # optional: git commit checks the facts of facts.yaml it touches
 ```
@@ -276,6 +276,7 @@ a soak test, the cores' deep idle state (about 2 % on the chat decode).
 | MobileNet V1 on the AR1335 MIPI camera, 640×480 | **20.7 ms** per frame, about 16 frames/s end to end with the annotated frames streamed to the host | [demo/camera](demo/camera/README.md) |
 | Moonshine base (speech to text, English) | **1.10 s** per LibriSpeech utterance (8.4 s of audio on average, RTF 0.13), WER 2.93 % (float 3.02 %); through the chat server 1.3 s for 10 s of audio | [ASR_PLAN §6–§7](doc/plans/ASR_PLAN.md), [Speech to text](demo/chat/doc/SPEECH_TO_TEXT.md) |
 | SmolVLA (vision-language-action, `lerobot/smolvla_base`) | **3.96 s** per chunk of 50 actions from two 480×640 cameras (1.31 s per camera image, 0.47 s prefix, 0.86 s for the ten denoising steps); actions within 4.0 % of float with the same noise (the policy's own spread between two noise samples: 66 %), bit-exact with the specification on 24 SO100 samples | [VLA_PLAN](doc/plans/VLA_PLAN.md), [demo/vla](demo/vla/README.md) |
+| V-JEPA 2 ViT-L video classification (Something-Something v2, `facebook/vjepa2-vitl-fpc16-256-ssv2`) | **13.8 s** per video (16 frames at 256×256 = 2048 tokens; 0.26 s of it the A53's resize and crop), 742 MiB CMA; accuracy 71.0 % on 100 clips, float's too; bit-exact with the specification on 8 videos | [VJEPA2_PLAN](doc/plans/VJEPA2_PLAN.md), [demo/video_classification](demo/video_classification/README.md) |
 
 The BERT, SmolLM2 and SmolVLM logits, the YOLOv5n head maps and the Piper
 audio samples are bit-exact with the scheduler's simulation; Moonshine's
