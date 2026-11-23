@@ -304,6 +304,11 @@ src/
                          the predicted inference time (the perf model, else the analytic cost
                          model); <= 5 % -> the R5, else the A53 (INFERENCE_RPU_RECOMMENDED in
                          the header, per entry; report.md "Cortex-R5") — RPU_PLAN §9.3
+  int8_spec.py           the 8-bit configuration's integer specification (../doc/plans/INT8_PLAN.md
+                         §6): int8 weights per output channel, blocked int8 activations (a 3-bit
+                         shift per block of 32, the producers' block rule), the exact block-shifted
+                         MatMul and its 40-bit accumulator, requantization, the packed DSP pair,
+                         the unsigned offset — the studies' i8 policies load it (llm_study.py)
   rowops_spec.py         the row-ops unit's integer specification (rne / sat16, rsqrt and sigmoid
                          tables, layer_norm / rms_norm / silu_mul / rope, fold, the register constants,
                          the parameter block and the 64 KiB table image)
@@ -359,7 +364,7 @@ test/
                          VectorOP / Matmul / Conv / RowOps kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              94 pytest modules, 1940 tests, all pass (test_bert_base.py
+  test_*.py              96 pytest modules, 1964 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

@@ -133,6 +133,12 @@ def rowops():
     return _src("rowops_spec")
 
 
+def i8spec():
+    """inference-scheduler/src/int8_spec.py: the 8-bit configuration's integer
+    specification (doc/plans/INT8_PLAN.md §6)."""
+    return _src("int8_spec")
+
+
 def vsmx():
     """inference-scheduler/src/vectorop_smx.py: the FPGA softmax's specification."""
     return _src("vectorop_smx")
@@ -493,6 +499,57 @@ class Stats:
                 for k, v in sorted(self.d.items())}
 
 
+I8_CAND = 8            # candidate int8 exponents: the calibration maximum's and 7 finer (clipping) ones
+
+
+class I8Cal:
+    """The static 8-bit operands' exponents (doc/plans/INT8_PLAN.md §6): q per head, the K / V
+    caches per KV head, the o projection's input (P.V's output) per tensor.  From the float
+    calibration's per-channel maxima (pass 1) the int8 exponent that does not clip; then, over
+    the calibration text again, the squared error of rounding at that exponent and the 7 finer
+    ones (pass 2, ``add``); ``formats``: the least-error candidate per group, as the format
+    classes q8 / k8 / vc8 / pv8, and the blocked inputs' int16 exponents (BLOCKED, xf)."""
+    RANGE = {"q": (-128, 127), "k": (-127, 127), "vc": (-127, 127), "pv": (-128, 127)}
+
+    # the blocked inputs of the linears (the RMSNorm / SiLU * up outputs): their int16 exponent
+    # becomes E8 + 8, E8 the int8 exponent of the calibration maximum — the producer writes on a
+    # grid finer than any block's (the int16 formats cap these classes at 8 for the int16 weights'
+    # sake, which the 8-bit weights, per output channel, do not need)
+    BLOCKED = ("x", "x2", "a")
+
+    def __init__(self, ch, cfg):
+        s8 = i8spec()
+        self.f8max, self.sse = {}, {}
+        self.base16 = {}
+        for l in range(cfg.L):
+            for cls in self.BLOCKED:
+                self.base16[(cls, l)] = s8.base_exponent(float(np.max(ch[(cls, l)]))) + 8
+        self.base16[("xf", cfg.L)] = s8.base_exponent(float(np.max(ch[("xf", cfg.L)]))) + 8
+        for l in range(cfg.L):                     # i8ob: the o input's block base (int8)
+            self.base16[("pvb", l)] = s8.base_exponent(float(np.max(ch[("pv", l)])))
+        groups = {"q": cfg.H, "k": cfg.KV, "vc": cfg.KV, "pv": 1}
+        src = {"q": "q", "k": "k", "vc": "v", "pv": "pv"}
+        for l in range(cfg.L):
+            for cls, n in groups.items():
+                mx = np.asarray(ch[(src[cls], l)], np.float64).reshape(n, -1).max(axis=1)
+                self.f8max[(cls, l)] = np.array([s8.base_exponent(float(m)) for m in mx], np.int64)
+                self.sse[(cls, l)] = np.zeros((n, I8_CAND))
+
+    def add(self, cls, l, x):                          # x [rows, groups, n] (float values)
+        f0 = self.f8max[(cls, l)]
+        lo, hi = self.RANGE[cls]
+        for c in range(I8_CAND):
+            sc = p2(f0 + c)[None, :, None]
+            r = np.clip(np.rint(x * sc), lo, hi) / sc
+            self.sse[(cls, l)][:, c] += ((r - x) ** 2).sum(axis=(0, 2))
+
+    def formats(self):
+        f = {(cls + "8", l): self.f8max[(cls, l)] + self.sse[(cls, l)].argmin(axis=1)
+             for (cls, l) in self.sse}
+        f.update(self.base16)
+        return f
+
+
 class Seq:
     """One sequence's KV cache: per layer K, V [KV, cap, HD] (values as stored in DDR)."""
     def __init__(self, cfg, cap):
@@ -543,6 +600,11 @@ class Model:
     cache's exponents (a constant of the application: position 0 is always
     <|im_start|>)."""
 
+    # the 8-bit configuration's switches (set in __init__; the class defaults keep the models of
+    # the other studies, which reuse these methods without this __init__, on the int16 path)
+    i8 = i8_attn = i8_head = i8_oblk = False
+    i8cal = None
+
     def __init__(self, W, cfg, pol=None, fmt=None, cos_sin=None, sink=None, sink_model=None,
                  record_ch=False, base=None):
         self.cfg = cfg
@@ -559,6 +621,10 @@ class Model:
         self.phase = "prefill"                             # forward(..., phase=)
         if self.bf:
             self.q = False
+        self.i8 = self.q and bool(self.pol.get("i8"))     # the 8-bit kernels (doc/plans/INT8_PLAN.md)
+        self.i8_attn = self.i8 and self.pol.get("i8_attn", True)
+        self.i8_head = self.i8 and self.pol.get("i8_head", True)
+        self.i8_oblk = self.i8 and bool(self.pol.get("i8_oblk"))
         self.fmt = fmt or {}
         if self.pol.get("res_bits") and ("res", cfg.L) in self.fmt:
             # the calibrated int32 residual's exponent (make_formats: a residual beyond 2^16)
@@ -567,6 +633,7 @@ class Model:
         self.sink_model = sink_model
         self._sink = {}
         self.record_ch = record_ch
+        self.i8cal = None                                  # an I8Cal: pass 2 of the 8-bit calibration
         W = weights().prepare(cfg, W)       # the plain block's tensors, as the frontend reads them
         L, H, KV = cfg.L, cfg.H, cfg.KV
         self.grp = np.arange(H) // (H // KV)
@@ -638,6 +705,8 @@ class Model:
         if not self.q:
             return Wt
         K, N = Wt.shape
+        if self.i8 and (key != "lm" or self.i8_head):   # int8, a power-of-two exponent per output column
+            return i8spec().encode_weights(Wt, axis=1)
         fa, fo, sh = self.Ev(ci, l, K), self.Ev(co, l, N), self.sh(key, l)
         assert sh == 8
         sc = p2(fo + sh)[None, :] / p2(fa)[:, None]      # 2^fw, fw = f_out + sh - f_in
@@ -703,7 +772,93 @@ class Model:
         ci, co = ("xf", "logits") if key == "lm" else LINEARS[key][1:]
         if not self.q:
             return self.fmm(x, self.w[(l, key)], co, l)
+        if self.i8 and (key != "lm" or self.i8_head):
+            return self.lin8(x, l, key, ci, co)
         return self.kmm(x * p2(self.E(ci, l)), self.w[(l, key)], self.E(co, l), self.sh(key, l), co, l)
+
+    def acc8(self, acc, co, l):
+        """the 8-bit accumulator: its peak (in units of the ACC_BITS range) and overflow count in
+        the statistics ("acc8:" + class), then the two's complement wrap."""
+        s8 = i8spec()
+        lim = 2.0 ** (s8.ACC_BITS - 1)
+        amax = float(np.abs(acc).max()) if acc.size else 0.0
+        self.stats.add("acc8:" + co, l, amax / lim, int((np.abs(acc) >= lim).sum()), acc.size)
+        return s8.wrap(acc)
+
+    def lin8(self, x, l, key, ci, co):
+        """The 8-bit kernels' linear (doc/plans/INT8_PLAN.md §6; int8_spec): the input's
+        producer rounds its int16 value (at the class's 16-bit exponents f16) to int8 blocks of
+        32 at the base exponent f8 = min f16 - 8 — static (d = 0) for the o projection, whose
+        input is ConvKernel's P.V output; int8 weights per output channel; the exact
+        block-shifted sums; rne + saturation to int16 at the output's exponents (row ops read
+        it)."""
+        s8 = i8spec()
+        wq, fw = self.w[(l, key)]
+        K, N = wq.shape
+        if key == "o" and self.i8_oblk:
+            # blocks at the base pvb: P.V wrote them (attn8_head; the values re-derive the same
+            # MatMul exactly), or a 16-bit attention's int16 output rounds to them
+            f8 = int(self.fmt[("pvb", l)])
+            if self.i8_attn:
+                xq, xd = s8.block_round_float(x, f8)
+            else:
+                e16 = self.Eh(ci, l, K)
+                xq, xd = s8.block_round(np.rint(x * p2(e16)[None, :]).astype(np.int64), e16 - f8)
+        elif key == "o" and self.i8_attn and ("pv8", l) in self.fmt:    # P.V wrote int8 (attn8_head)
+            f8 = int(np.asarray(self.fmt[("pv8", l)]).flat[0])
+            xq, xd = np.rint(x * p2(f8)).astype(np.int64), 0
+        else:
+            e16 = self.Eh(ci, l, K)
+            f8 = int(e16.min()) - 8
+            if key == "o" and ("pv8", l) in self.fmt:       # a 16-bit P.V (i8lin): static at pv8
+                f8 = int(np.asarray(self.fmt[("pv8", l)]).flat[0])
+            A = np.rint(x * p2(e16)[None, :]).astype(np.int64)
+            xq, xd = s8.block_round(A, e16 - f8, dmax=0 if key == "o" else s8.DELTA_MAX)
+        acc, g = s8.matmul(xq, f8, xd, wq, fw, acc_bits=63)
+        acc = self.acc8(acc, co, l)
+        eo = self.Eh(co, l, N)
+        r = s8.requant(acc, g, eo, I16_LO, I16_HI)
+        self.stats.add(co, l, float(np.abs(acc * p2(-g)[None, :]).max()) if acc.size else 0.0,
+                       int(((r == I16_LO) | (r == I16_HI)).sum()), r.size)
+        return r / p2(eo)[None, :]
+
+    P8_BASE = 6           # P's int8 base exponent: 127 * 2^-6 > 1, blocks down to 2^-13
+    P8_SRC = 14           # the softmax writes P at 2^-14 (int16) before the block rounding
+
+    def attn8_head(self, qh, Kg, Vg, mask, fq, fk, fs, fv, fpv, l, unit, h=0, g=0):
+        """One head of the 8-bit attention (doc/plans/INT8_PLAN.md §6): q int8 static per head,
+        the K / V caches int8 per head in [-127, 127] (the packed operand), the scores at their
+        int16 exponent (rne), P from the softmax at 2^-14 rounded to int8 blocks of 32 keys at
+        base 2^-6, P.V at the o input's int16 exponents.  The caches' int8 values are the
+        int16 ones rounded once (rne) — what the writer of the cache stores.  The static
+        exponents are the 8-bit calibration's (I8Cal: formats q8 / k8 / vc8 / pv8; else the
+        int16 ones - 8); with pv8, P.V writes the o input as int8 at it."""
+        s8 = i8spec()
+        def f8(cls, i, dflt):
+            return int(self.fmt[(cls, l)][i]) if (cls, l) in self.fmt else dflt
+        fq8, fk8 = f8("q8", h, int(fq) - 8), f8("k8", g, int(fk) - 8)
+        fv8 = np.full(len(fv), f8("vc8", g, 0)) if ("vc8", l) in self.fmt else np.asarray(fv, np.int64) - 8
+        q8 = np.clip(np.rint(qh * p2(fq8)), s8.I8_LO, s8.I8_HI).astype(np.int64)
+        k8 = np.clip(np.rint(Kg * p2(fk8)), s8.W8_LO, s8.W8_HI).astype(np.int64)
+        acc, g = s8.matmul(q8, fq8, 0, k8.T, np.full(Kg.shape[0], fk8), acc_bits=63)
+        acc = self.acc8(acc, "s", l)
+        s = s8.requant(acc, g, int(fs), I16_LO, I16_HI) / p2(fs)
+        p = self.softmax(s, mask, fs, self.P8_SRC, l, unit=unit)
+        pad = (-p.shape[1]) % s8.BLOCK
+        A = np.rint(np.pad(p, ((0, 0), (0, pad))) * p2(self.P8_SRC)).astype(np.int64)
+        P8, Pd = s8.block_round(A, self.P8_SRC - self.P8_BASE)
+        v8 = np.clip(np.rint(Vg * p2(fv8)[None, :]), s8.W8_LO, s8.W8_HI).astype(np.int64)
+        acc, g = s8.matmul(P8, self.P8_BASE, Pd, np.pad(v8, ((0, pad), (0, 0))), fv8, acc_bits=63)
+        acc = self.acc8(acc, "pv", l)
+        if self.i8_oblk:                                   # blocks of 32 along the head's channels
+            fo = int(self.fmt[("pvb", l)])
+            q, d = s8.requant_blocked(acc, g, fo)
+            return s8.block_value(q, fo, d)
+        if ("pv8", l) in self.fmt:
+            fo = int(np.asarray(self.fmt[("pv8", l)]).flat[0])
+            return s8.requant(acc, g, fo) / p2(fo)
+        r = s8.requant(acc, g, fpv, I16_LO, I16_HI)
+        return r / p2(fpv)[None, :]
 
     def rms(self, h, gamma, cls, l):
         if self.q and self.pol.get("inorm") and self.pol.get("res_bits") and not self.exact(cls):
@@ -933,6 +1088,10 @@ class Model:
                 out[:, h] = self.fmm(p, V[g], "pv", l, slice(h * HD, (h + 1) * HD), cfg.H * HD)
                 continue
             fvg = fv[g * HD:(g + 1) * HD]
+            if self.i8_attn:
+                out[:, h] = self.attn8_head(q[:, h], K[g], V[g], mask, fq[h], fk[g], fs[h], fvg,
+                                            fpv[h * HD:(h + 1) * HD], l, w is None, h, g)
+                continue
             s = self.kmm(q[:, h] * p2(fq[h]), (K[g] * p2(fk[g])).T, fs[h], shs[h], "s", l)
             p = self.softmax(s, mask, fs[h], fp[h], l, unit=w is None)
             out[:, h] = self.kmm(p * p2(fp[h]), V[g] * p2(fvg)[None, :], fpv[h * HD:(h + 1) * HD], shp[h], "pv", l)
@@ -1023,6 +1182,10 @@ class Model:
             if self.q and ("vc", l) in self.fmt:            # host writes the V cache at its own exponent
                 v = self.host(v, "vc", l, self.E("vc", l))
             v = v.reshape(T, KV, HD)
+            if self.i8cal is not None:
+                self.i8cal.add("q", l, q)
+                self.i8cal.add("k", l, k)
+                self.i8cal.add("vc", l, v)
             att = np.empty((T, H, HD))
             for i, s in enumerate(seqs):
                 a, b = offs[i], offs[i + 1]
@@ -1030,6 +1193,8 @@ class Model:
                 s.v[l][:, s.n:s.n + b - a] = v[a:b].transpose(1, 0, 2)
                 n1 = s.n + b - a
                 att[a:b] = self.attn(q[a:b], s.k[l][:, :n1], s.v[l][:, :n1], s.n, l)
+            if self.i8cal is not None:
+                self.i8cal.add("pv", l, att.reshape(T, 1, H * HD))
             o = self.lin(att.reshape(T, H * HD), l, "o")
             if cfg.post_norms:                              # the attention output's norm, then the add
                 o = self.rms_in(o, self.gao[l], "o", "on", l)
@@ -1175,10 +1340,15 @@ POLICIES = {
 # Modifiers after a POLICIES name (policy_spec; CHAT_PLAN §31): the formats' (x / x2 / a / xf
 # / q / k / vc + N: that class's exponent cap instead of in_cap, mN: margin N, pN: softmax P
 # at 2^-N) and the
-# execution's (vsmx, rowops, drope, hprep: as the named policies above), e.g.
-# "pow2+sink+p12+xf5+vc6+vsmx+rowops+hprep".
+# execution's (vsmx, rowops, drope, hprep: as the named policies above; i8: the 8-bit
+# configuration, doc/plans/INT8_PLAN.md — Model.lin8 / attn8_head), e.g.
+# "pow2+sink+p12+xf5+vc6+vsmx+rowops+hprep", "pow2+sink+p12+vsmx+rowops+drope+i8".
 _CAP = re.compile(r"(x|x2|a|xf|q|k|vc)(\d+)$")
-_MODS = {"vsmx": dict(vsmx="prefill"),
+_MODS = {"i8": dict(i8=True),
+         "i8lin": dict(i8=True, i8_attn=False),        # ablations: the attention at 16 bits,
+         "i8h16": dict(i8=True, i8_head=False),        # the LM head at 16 bits
+         "i8ob": dict(i8=True, i8_oblk=True),          # the o input blocked (P.V writes blocks)
+         "vsmx": dict(vsmx="prefill"),
          "rowops": dict(res_bits=15, inorm=True, isilu=True, irope="prefill"),
          "drope": dict(irope=True),
          "hprep": dict(irope=None)}
@@ -1358,17 +1528,18 @@ def load_all(assets):
     return cfg, weights().prepare(cfg, ckpt().Tracked(load_safetensors(assets)))
 
 
-def build_data(assets, tok, quick, prof=None):
+def build_data(assets, tok, quick, prof=None, nwin=None):
     """Chat prompts (a text profile: story beginnings); held-out windows and the
     calibration text start with the sink token (<|im_start|> / <s>: position 0 of
     every sequence) followed by plain text, so every sequence has the same
     position-0 token.  CTX tokens of calibration text either way (a
-    text profile's shorter context: several windows)."""
+    text profile's shorter context: several windows).  nwin: held-out windows (default the
+    profile's; at most what the held-out text holds)."""
     prof = prof or Profile(assets)
     prompts = [(name, prof.prompt_ids(tok, m)) for name, m in prof.prompts]
     ids = prof.heldout_ids(tok, assets, prof.texts[0])
     win = min(256, prof.ctx) if quick else prof.ctx
-    nwin = 1 if quick else prof.windows
+    nwin = 1 if quick else (nwin or prof.windows)
     assert len(ids) >= (win - 1) * nwin, len(ids)
     held = [np.concatenate([[prof.sink], ids[i * (win - 1):(i + 1) * (win - 1)]]) for i in range(nwin)]
     cids = prof.heldout_ids(tok, assets, prof.texts[1])
@@ -1471,8 +1642,7 @@ def cmd_study(args):
     cfg, W = load_all(assets)
     tok = Tok(assets)
     prof = Profile(assets)
-    prompts, held, calib = build_data(assets, tok, args.quick, prof)
-    held = held[:args.windows or prof.windows]
+    prompts, held, calib = build_data(assets, tok, args.quick, prof, args.windows)
     max_new = 32 if args.quick else args.max_new
     cs = rope_sets(cfg, 2 * CTX)
     log(f"study {time.strftime('%Y-%m-%d %H:%M:%S')}  {prof.kind} profile, context {prof.ctx}, prompts {len(prompts)} "
@@ -1490,6 +1660,14 @@ def cmd_study(args):
             teacher_forced(cm, c)
         cal[sink] = cm.stats.ch
         del cm
+    i8fmt = {}
+    if any(name != "float" and policy_spec(name) and policy_spec(name).get("i8") for name in pols):
+        cm = Model(W, cfg, None, cos_sin=cs, base=fm, sink=True, sink_model=fm0)
+        cm.i8cal = I8Cal(cal[True], cfg)
+        for c in calib:
+            teacher_forced(cm, c)
+        i8fmt = cm.i8cal.formats()
+        del cm
     log(f"  calibration {time.time() - t0:.0f}s")
     results = {"float": {k: v for k, v in ref.items() if k not in ("tf_lp", "h_lp", "tf_top1", "h_top1")}}
     for name in pols:
@@ -1497,6 +1675,8 @@ def cmd_study(args):
             continue
         pol = policy_spec(name)
         fmt = make_formats(pol, cal[bool(pol.get("sink"))], W, cfg)
+        if pol.get("i8"):
+            fmt.update(i8fmt)
         m = Model(W, cfg, pol, fmt, cos_sin=cs, sink_model=fm0)
         r = run_policy(name, m, prompts, held, ref, max_new, log, do_greedy=not args.nogreedy,
                        eog=prof.eog)
@@ -1845,7 +2025,8 @@ def main():
     ap.add_argument("--quick", action="store_true", help="4 prompts, 32 new tokens, one 256-token held-out window")
     ap.add_argument("--out", default=None)
     ap.add_argument("--windows", type=int, default=None,
-                    help="held-out windows of the context's length (default: 3 x 1024 tokens)")
+                    help="held-out windows of the context's length (default: the profile's, 3 x 1024 "
+                         "tokens; at most what the held-out text holds — 12 for SmolLM2's)")
     ap.add_argument("--nogreedy", action="store_true", help="skip the policies' greedy generations")
     args = ap.parse_args()
     {"fetch": cmd_fetch, "validate": cmd_validate, "validate-arch": cmd_validate_arch, "study": cmd_study,

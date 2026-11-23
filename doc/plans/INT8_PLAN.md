@@ -378,9 +378,10 @@ with the cost models.
    - Elements are at `2^(E − δ)`.
    - The writer of the tensor sets δ from the block's maximum and rounds to nearest,
      ties to even.
-   - A tensor may be static (δ = 0 throughout).  That covers the o_proj input (P·V's
-     output), the KV cache, q, and the CNN tensors that VectorOP / PoolingKernel also
-     read.
+   - A tensor may be static (δ = 0 throughout).  That covers the KV cache, q, and the
+     CNN tensors that VectorOP / PoolingKernel also read.
+   - The o_proj input is blocked: ConvKernel's P·V writes it as blocks.  A static o
+     input cost 0.2 points on 12 windows (§9.4).
 3. **Attention.**
    - K, V (the KV cache) and q: int8, static per head.
    - P: int8 in blocks of 32 keys, δ set by the softmax unit.
@@ -416,8 +417,9 @@ Against the alternatives:
 
 The block scheme costs the hardware two things:
 - a 3-bit shift where §5.1 already splits the packed fields;
-- a block-maximum unit in the writers that need one: the row-ops unit and the softmax
-  unit, and later the drains if a CNN needs it.
+- a block-maximum unit in the writers that need one: the row-ops unit, the softmax
+  unit and ConvKernel's drain (the P·V output, §9.4); MatmulKernel's drain if a model
+  needs it.
 
 ## 7. Development plan
 
@@ -459,6 +461,125 @@ The block scheme costs the hardware two things:
 
 **Not measured yet:** the numbers of §5.4 are estimates.  Phase 2 prices them with
 the cost models.
+
+## 9. Phase 1 log
+
+### 9.1 The integer specification (2026-11-23)
+
+`inference-scheduler/src/int8_spec.py` (test: `test/test_int8_spec.py`, 19 cases
+against exact arithmetic) fixes the details §6 left open:
+- **Weights.**  `encode_weights`: round half to even, [−127, 127], per output
+  channel the least-error exponent of three (the finest that does not clip, and two
+  finer).
+- **Block rule.**  `block_round`: d = the largest shift in [0, 7] at which the
+  block's rne values fit [−128, 127]; one rounding per element; none fits → d = 0,
+  saturated.  For the hardware this means a compare of the block's maximum and
+  minimum per candidate shift.
+- **MatMul.**  `matmul`: block sums shifted by 7 − d into an accumulator at
+  `f_x + 7 + f_w[n]`, two's complement over 40 bits.  The spec evaluates it exactly
+  in float64 (|x · 2^(7−d)| < 2^14, partial sums < 2^53).  A static input takes any
+  K; a blocked one needs whole blocks.
+- **Requantization.**  `requant` / `requant_blocked`: a per-channel shift, rne,
+  saturation (int8, or int16 where a row op reads the output).
+- **Packed pair and offset.**  `pack_pair` / `unpack`: the 27-bit word and the
+  extraction, checked over random and extreme 16-term chains; −128 weights break
+  them.  `to_offset` / `offset_bias`: post-ReLU tensors stored at −128.
+
+### 9.2 The LLM study's `i8` policy
+
+`demo/chat/scripts/llm_study.py` gets:
+- the policy modifier `i8` (ablations `i8lin`: 16-bit attention; `i8h16`: 16-bit LM
+  head);
+- `Model.lin8` and `Model.attn8_head` on `int8_spec`;
+- a second calibration pass, `I8Cal`.  It picks the static operands' int8 exponents
+  (q per head, K / V per KV head, the o input per tensor) by least squared error over
+  the maximum's exponent and 7 finer ones, and the blocked inputs' int16 exponent
+  E₈ + 8.
+
+Tested on the tiny Llama: `inference-scheduler/test/test_int8_llm.py`, 4 cases, a
+linear and an attention head bit-exact with the spec.
+
+Two findings from bringing it up, both now requirements of the spec:
+1. **Static operands need least-error exponents.**  The int16 exponent − 8 gave
+   some heads an int8 step of 8, and ppl 1009.
+2. **A blocked tensor's producer must round from a grid finer than its finest
+   block.**  The int16 formats keep the norm and SiLU outputs at Q8.8, which protects
+   the int16 weights; at 8 bits the weights no longer need it.  Taken as the base,
+   Q8.8 left the blocks 4–6 bits short.  The row-ops unit's NORM / MULACT must round
+   to blocks from their internal precision, not from the int16 they write today.
+
+SmolLM2-135M, the study's 3 held-out windows (float 15.598), 12 greedy answers:
+
+| policy | ppl | Δ | top-1 held-out | KL | identical answers |
+|---|---:|---:|---:|---:|---:|
+| `pow2+sink+p12+vsmx+rowops+drope` (int16, deployed) | 15.600 | +0.01 % | 0.968 | 0.0025 | 4/12 |
+| `…+i8` | 15.893 | +1.9 % | 0.922 | 0.018 | 1/12 |
+| `…+i8h16` (LM head 16-bit) | 15.824 | +1.45 % | 0.924 | 0.015 | 1/12 |
+| `…+i8lin` (attention 16-bit; before the base fix) | 15.904 | +2.0 % | 0.934 | 0.017 | – |
+| torch screen, same windows: everything 8-bit / linears only | 15.752 / 15.615 | +1.0 / +0.1 % | | | |
+
+Bisection of the gap to the screen (a scratch ppl, float 15.656, LM head 16-bit):
+
+| | o input static | o input blocked |
+|---|---:|---:|
+| the screen's linears in the study's float model | — | 15.688 (+0.21 %) |
+| the study's 8-bit linears | 15.783 (+0.81 %) | 15.739 (+0.53 %) |
+| + the study's 8-bit attention | 15.875 (+1.40 %) | 15.841 (+1.18 %) |
+
+What the bisection shows:
+- **Row ops.**  The integer row ops add nothing: on the float-row-ops base the same
+  `i8h16` gives 15.817.
+- **The static o input** costs ~0.25 %.  ConvKernel's P·V should write blocks: its
+  drain sees all of a token's channels.
+- **The 8-bit attention** costs ~0.6 %, against ~0.2 % in the screen.  The screen
+  quantized q / K before RoPE and never rounded the sink row.  The sink is not the
+  cause: 2 of 180 sink rows clip, and protecting them is worse (15.953).
+- **The operand ablation** (one of q, K, V, P back at 16 bits) is §9.3.
+
+### 9.3 The attention's operands, and the evaluation's resolution
+
+With one operand at a time back at 16 bits (the rest as in `i8h16`, o input static):
+
+| | q16 | k16 | v16 | p16 | all 8-bit |
+|---|---:|---:|---:|---:|---:|
+| ppl (scratch definition, float 15.656) | 15.886 | 15.912 | 15.860 | 15.899 | 15.875 |
+
+No single operand accounts for the attention's ~0.6 %.  The spread between these
+runs (±0.04, ~0.3 %) is the resolution of 3 windows of 1024 tokens, so the
+attention's cost and the study-vs-screen gap below ~0.3 % need the full 12
+held-out windows.
+
+The study gets the modifier `i8ob`: P·V writes the o input as blocks of 32 straight
+from its accumulator (`requant_blocked` per head; base `pvb`, the int8 exponent of
+the calibration maximum).  The o linear re-derives the same values: the block rule is
+idempotent on values, `test_rule_is_idempotent_on_values`.  On the 12 windows: §9.4.
+
+### 9.4 SmolLM2-135M on all 12 held-out windows
+
+`llm_study.py study --windows 12`: `--windows` now asks `build_data` for that many
+windows, up to what the held-out text holds; before, it could only shrink the
+profile's 3.  Float 18.156 is the torch screen's float on the same windows.
+
+| policy | ppl | Δ | top-1 held-out | KL held-out |
+|---|---:|---:|---:|---:|
+| `pow2+sink+p12+vsmx+rowops+drope` (int16, deployed) | 18.192 | +0.20 % | 0.965 | 0.0028 |
+| `…+i8` (o input static) | 18.495 | +1.87 % | 0.911 | 0.019 |
+| **`…+i8ob`** (o input blocked) | **18.456** | **+1.65 %** | **0.915** | **0.018** |
+| torch screen: everything 8-bit, o static (§3.3) | 18.376 | +1.21 % | 0.922 | |
+
+What these show:
+- **The o input.**  A blocked o input is worth 0.2 points: P·V writes blocks (§6
+  item 2 changes accordingly: no static o input).
+- **The integer spec costs ~0.4 points more than the screen.**  About 0.2 of that is
+  the int16 base's own cost on these windows.  The rest is the bounded P window,
+  the int16 producers' double rounding, and the screen's pre-RoPE q / K, each below
+  this evaluation's resolution on its own (§9.3).
+- **The gate.**  +1.65 % sits above the phase's ≤ +1.5 % gate.  The levers, in order
+  of cost:
+  1. the LM head (~0.5 points, §9.2) at 16 bits or W8A16;
+  2. fine-tuning against the integer spec (`qat.py` against the spec, not the
+     screen);
+  3. per-channel smoothing of q / K before RoPE (the screen's form).
 
 ## Sources
 
