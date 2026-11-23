@@ -602,7 +602,7 @@ class Model:
 
     # the 8-bit configuration's switches (set in __init__; the class defaults keep the models of
     # the other studies, which reuse these methods without this __init__, on the int16 path)
-    i8 = i8_attn = i8_head = i8_oblk = False
+    i8 = i8_attn = i8_head = i8_oblk = i8_head_a16 = False
     i8cal = None
 
     def __init__(self, W, cfg, pol=None, fmt=None, cos_sin=None, sink=None, sink_model=None,
@@ -625,6 +625,7 @@ class Model:
         self.i8_attn = self.i8 and self.pol.get("i8_attn", True)
         self.i8_head = self.i8 and self.pol.get("i8_head", True)
         self.i8_oblk = self.i8 and bool(self.pol.get("i8_oblk"))
+        self.i8_head_a16 = self.i8_head and bool(self.pol.get("i8_head_a16"))
         self.fmt = fmt or {}
         if self.pol.get("res_bits") and ("res", cfg.L) in self.fmt:
             # the calibrated int32 residual's exponent (make_formats: a residual beyond 2^16)
@@ -795,6 +796,16 @@ class Model:
         s8 = i8spec()
         wq, fw = self.w[(l, key)]
         K, N = wq.shape
+        if key == "lm" and self.i8_head_a16:              # W8A16: the int16 input as it is
+            e16 = int(np.asarray(self.Eh(ci, l, K)).min())
+            assert (self.Eh(ci, l, K) == e16).all(), "the W8A16 input has one exponent"
+            acc, g = s8.matmul_w8a16(np.rint(x * p2(e16)).astype(np.int64), e16, wq, fw, acc_bits=63)
+            acc = self.acc8(acc, co, l)
+            eo = self.Eh(co, l, N)
+            r = s8.requant(acc, g, eo, I16_LO, I16_HI)
+            self.stats.add(co, l, float(np.abs(acc * p2(-g)[None, :]).max()) if acc.size else 0.0,
+                           int(((r == I16_LO) | (r == I16_HI)).sum()), r.size)
+            return r / p2(eo)[None, :]
         if key == "o" and self.i8_oblk:
             # blocks at the base pvb: P.V wrote them (attn8_head; the values re-derive the same
             # MatMul exactly), or a 16-bit attention's int16 output rounds to them
@@ -1348,6 +1359,7 @@ _MODS = {"i8": dict(i8=True),
          "i8lin": dict(i8=True, i8_attn=False),        # ablations: the attention at 16 bits,
          "i8h16": dict(i8=True, i8_head=False),        # the LM head at 16 bits
          "i8ob": dict(i8=True, i8_oblk=True),          # the o input blocked (P.V writes blocks)
+         "i8hw": dict(i8=True, i8_head_a16=True),      # the LM head W8A16 (int16 input, int8 weights)
          "vsmx": dict(vsmx="prefill"),
          "rowops": dict(res_bits=15, inorm=True, isilu=True, irope="prefill"),
          "drope": dict(irope=True),
@@ -1807,7 +1819,8 @@ def cmd_formats(args):
     cache exponents) as JSON — the input the phase-3 scheduler needs to reproduce
     the emulation.  Keys "<class>@<layer>" (layer 30 = final norm / LM head);
     values an int or a per-channel list (per head for q, k, p).  Weight exponents
-    are implied: fw[i][j] = f_out[j] + 8 - f_in[i]."""
+    are implied: fw[i][j] = f_out[j] + 8 - f_in[i] (an i8 policy: int8_spec.encode_weights'
+    per output channel; its 8-bit classes from I8Cal are in the same table)."""
     cfg, W = load_all(args.assets)
     tok = Tok(args.assets)
     _, _, calib = build_data(args.assets, tok, False)
@@ -1817,6 +1830,12 @@ def cmd_formats(args):
     for c in calib:
         teacher_forced(cm, c)
     fmt = make_formats(pol, cm.stats.ch, W, cfg)
+    if pol.get("i8"):                       # the 8-bit classes (I8Cal: q8 / k8 / vc8 / pv8, pvb, x / x2 / a / xf)
+        c8 = Model(W, cfg, None, base=fm, sink=True, sink_model=fm)
+        c8.i8cal = I8Cal(cm.stats.ch, cfg)
+        for c in calib:
+            teacher_forced(c8, c)
+        fmt.update(c8.i8cal.formats())
     out = {"policy": args.base, "spec": pol, "margin": float(pol.get("margin", MARGIN)),
            "exponents": {f"{k[0]}@{k[1]}": np.asarray(v).tolist() for k, v in fmt.items()}}
     if pol.get("sink"):

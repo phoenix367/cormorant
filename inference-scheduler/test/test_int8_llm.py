@@ -113,6 +113,20 @@ class TestI8Policy(unittest.TestCase):
         ref = (e / e.sum(-1, keepdims=True)) @ V
         self.assertLess(np.abs(y - ref).max(), 0.1 * np.abs(ref).max())
 
+    def test_head_w8a16_equals_spec(self):
+        sc = self.sc
+        pol = dict(study.policy_spec(POLICY8 + "+i8hw"))
+        m = study.Model(self.W, sc, pol, self.m8.fmt, sink_model=self.fm)
+        self.assertTrue(m.i8_head_a16)
+        rng = np.random.default_rng(8)
+        wq, fw = m.w[(sc.L, "lm")]
+        e16 = int(np.asarray(m.Eh("xf", sc.L, wq.shape[0])).min())
+        x = np.rint(rng.normal(size=(4, wq.shape[0])) * 2.0 ** e16) / 2.0 ** e16
+        y = m.lin(x, sc.L, "lm")
+        acc, g = s8.matmul_w8a16(np.rint(x * 2.0 ** e16).astype(np.int64), e16, wq, fw)
+        eo = m.Eh("logits", sc.L, wq.shape[1])
+        np.testing.assert_array_equal(y, s8.requant(acc, g, eo, -32768, 32767) / 2.0 ** eo)
+
     def test_logits_close_to_int16(self):
         sc = self.sc
         rng = np.random.default_rng(7)

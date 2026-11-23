@@ -35,6 +35,9 @@ int8 output by the same rule as any producer (``requant_blocked``).
 products keep |S1| <= 260 096 < 2^(FIELD-1) and both sums are recovered exactly
 (``unpack``).
 
+**W8A16.**  ``matmul_w8a16``: an int16 input times int8 weights, one product per DSP — for a
+layer whose input needs 16 bits while its weight bytes matter (the LM head).
+
 **Unsigned tensors.**  A static post-ReLU tensor holds u in [0, 255] stored as
 q = u - 128; the consumer adds 128 * sum_k w[k][n] to its accumulator (in the
 bias, ``offset_bias``), and the padding of such a tensor is -128.
@@ -214,6 +217,23 @@ def matmul(xq, f_x: int, xd, wq, f_w, block: int = BLOCK, dmax: int = DELTA_MAX,
         acc = acc + np.asarray(bias_acc, dtype=np.int64)
     g = f_x + dmax + np.asarray(f_w, dtype=np.int64)
     return wrap(acc, acc_bits), g
+
+
+def matmul_w8a16(x16, f_x: int, wq, f_w, bias_acc=None,
+                 acc_bits: int = ACC_BITS) -> Tuple[np.ndarray, np.ndarray]:
+    """The W8A16 mode (INT8_PLAN §9.5): an int16 input at one exponent f_x times int8 weights at
+    the per-column exponents f_w — one product per DSP48E2 (int16 on the 18-bit port, int8 on the
+    27-bit one), no blocks, no packing.  For the layers whose input 8 bits cost too much while
+    their weights' bytes are what matters (the LM head: a bandwidth-bound GEMV in decode).
+    Returns (acc, g): value = acc * 2^-g, g = f_x + f_w; exact (|x * w| < 2^22, K < 2^31)."""
+    x16 = np.asarray(x16, dtype=np.int64)
+    wq = np.asarray(wq, dtype=np.int64)
+    if x16.shape[-1] != wq.shape[0]:
+        raise ValueError(f"K mismatch: x {x16.shape[-1]}, w {wq.shape[0]}")
+    acc = np.rint(x16.astype(np.float64) @ wq.astype(np.float64)).astype(np.int64)
+    if bias_acc is not None:
+        acc = acc + np.asarray(bias_acc, dtype=np.int64)
+    return wrap(acc, acc_bits), f_x + np.asarray(f_w, dtype=np.int64)
 
 
 def bias_raw(bias, g) -> np.ndarray:

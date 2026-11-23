@@ -581,6 +581,66 @@ What these show:
      screen);
   3. per-channel smoothing of q / K before RoPE (the screen's form).
 
+### 9.5 Levers 1 and 2: the LM head, and fine-tuning against the spec (8 bits wherever possible)
+
+**Lever 1, the LM head as W8A16.**  The head keeps 8-bit weights, so its 28 MB halve,
+and reads its input at 16 bits: the modifier `i8hw`, `int8_spec.matmul_w8a16`, an int16
+× int8 product per DSP, unpacked.
+- **Where it runs.**  The head only ever runs as a one-row GEMV on MatmulKernel: in
+  prefill it reads only the last row.  So the 16 × 8 mode is needed in the GEMV path
+  alone.
+- **Speed.**  That path is weight-bandwidth bound, and the 16-bit input costs it
+  nothing.
+- **Accuracy.**  `…+i8ob+i8hw` on the 12 windows: ppl **18.409 (+1.39 %)**, top-1 0.918,
+  KL 0.016, against `…+i8ob`'s 18.456 (+1.65 %).
+
+**Lever 2, distillation against the integer spec.**  `demo/chat/scripts/llm_qat.py`
+trains the linears' weights of SmolLM2-135M.  Its forward follows `int8_spec` with the
+policy's own 8-bit formats: `llm_study.py formats --base <policy>+i8ob` now runs the
+`I8Cal` pass and writes the 8-bit classes into the same exponents table.
+- the weights' per-channel exponents chosen by the spec's rule at every step;
+- the linears' inputs in bounded blocks, the o input blocked;
+- q / K / V static per head after RoPE, P in blocks of 32 keys;
+- the LM head at 8 bits, frozen (tied to the embedding);
+- straight-through rounding.
+
+Training ran 1000 steps of KL to the float teacher on WikiText-2 train: 4 × 256 tokens
+a step, AdamW 1e-5, 50 warmup steps then cosine, 69 min on the GTX 1050.  The trained
+weights were saved as a float32 checkpoint and judged by the bit-exact study, which
+recalibrates its formats on them.  12 windows, against the original float 18.156:
+
+| | ppl | Δ | top-1 held-out | KL held-out | identical answers |
+|---|---:|---:|---:|---:|---:|
+| original, `…+i8ob` (everything 8-bit) | 18.456 | +1.65 % | 0.915 | 0.018 | – |
+| original, `…+i8ob+i8hw` | 18.409 | +1.39 % | 0.918 | 0.016 | – |
+| **fine-tuned, `…+i8ob` (everything 8-bit)** | **18.307** | **+0.83 %** | **0.930** | **0.013** | **2/12** |
+| fine-tuned, `…+i8ob+i8hw` (LM head W8A16) | 18.270 | +0.63 % | 0.936 | 0.011 | 2/12 |
+| int16, deployed | 18.192 | +0.20 % | 0.965 | 0.0028 | 4/12 |
+
+The fine-tuned model's own float ppl is 18.151, so fine-tuning recovered the
+quantization loss rather than moving the model.  Its top-1 and KL are measured against
+that float.
+
+**Result: with fine-tuning, SmolLM2-135M runs entirely at 8 bits within the gate.**
+Weights, linear inputs, K, V, q, P and the LM head are all 8-bit, at +0.83 % ppl.  With
+the head's input at 16 bits (W8A16) it is +0.63 %.  Both are recorded for phase 2 to
+choose.  The head's 16 × 8 mode costs MatmulKernel's GEMV little, but "8-bit wherever
+possible" makes the all-8-bit head the default.
+
+The pipeline, reproducibly:
+1. `llm_study.py formats --base pow2+sink+p12+vsmx+rowops+drope+i8ob --out F.json`;
+2. `llm_qat.py ASSETS F.json OUT --train-text wikitext2_train.txt --steps 1000`;
+3. `llm_study.py study --assets OUT --policies …+i8ob,…+i8ob+i8hw --windows 12`.
+
+Open for the other models: the training text matches the evaluation's domain here
+(WikiText-2).  On the chat prompt set (`tf`: chat prompts and float's greedy answers,
+not WikiText) the signal is mixed:
+- KL improved, 0.022 → 0.017;
+- top-1 fell, 0.943 → 0.931, each against its own model's float.
+
+The chat models' fine-tuning should therefore distill on chat-style text as well
+(float's own answers to prompts, LLM-QAT style), and be judged on answer quality.
+
 ## Sources
 
 [1] https://docs.amd.com/v/u/en-US/wp486-deep-learning-int8 ·

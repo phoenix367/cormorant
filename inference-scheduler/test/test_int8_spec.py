@@ -218,6 +218,20 @@ class TestMatmul(unittest.TestCase):
         np.testing.assert_array_equal(d, d2)
 
 
+class TestW8A16(unittest.TestCase):
+
+    def test_exact(self):
+        rng = np.random.default_rng(14)
+        x = rng.integers(-32768, 32768, size=(3, 576))
+        wq = rng.integers(-127, 128, size=(576, 40))
+        f_w = rng.integers(4, 9, size=40)
+        acc, g = s8.matmul_w8a16(x, 9, wq, f_w)
+        ref = np.array([[sum(int(a) * int(b) for a, b in zip(row, col, strict=True)) for col in wq.T] for row in x])
+        np.testing.assert_array_equal(acc, ref)
+        np.testing.assert_array_equal(g, 9 + f_w)
+        self.assertLess(np.abs(acc).max(), 2 ** (s8.ACC_BITS - 1))
+
+
 class TestPackedPair(unittest.TestCase):
 
     def test_chain_bound(self):
