@@ -21,10 +21,21 @@ deployed stack.  Writes OUT/ as a checkpoint directory (the source's files, the 
 as float32 model.safetensors, qat_log.json) that llm_study.py --assets reads.
 
 The 4 GB GTX 1050 of the dev PC holds SmolLM2-135M (student, teacher, AdamW): ~4 s a step of
-4 x 256 tokens; 1000 steps ~70 min.  The repository's .venv-export has a CPU torch (~17 s a
-step); a CUDA torch for the Pascal GPU is torch 2.14.0+cu126 (CUDA 13 dropped sm_61).
+4 x 256 tokens; 1000 steps ~70 min.  For SmolLM2-360M (doc/plans/INT8_PLAN.md §9.9):
+--topk K keeps the teacher off the GPU while the student trains — it first computes every
+training window's K most likely tokens (log-probabilities, on the CPU side; --topk-cache
+keeps them in a file) and the evaluation windows' argmax, then leaves; the loss is the
+exact KL over those K and one bucket for the rest of the vocabulary (renormalising over the
+K instead sharpened the student and raised its perplexity, INT8_PLAN §9.9) —
+--optim adafactor (factored second moments, no first) replaces AdamW's two full-size
+moments (it lacks AdamW's momentum: on 360M the evaluation got worse), --optim adamw-cpu
+keeps AdamW's state and master weights in host RAM (the step's gradients copied down, the
+updated weights back), and --groups 2 trains every other layer in a step (half the
+gradients held).  The repository's .venv-export has a CPU torch (~17 s a step); a CUDA torch for
+the Pascal GPU is torch 2.14.0+cu126 (CUDA 13 dropped sm_61).
 
 usage: llm_qat.py ASSETS FORMATS.json OUT_DIR --train-text FILE [--steps 1000] [--head-a16]
+           [--topk 64 --optim adamw-cpu --groups 2 --seq 128 --accum 8]
 """
 import argparse
 import copy
@@ -41,6 +52,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AttentionInterface
 from transformers.models.llama.modeling_llama import repeat_kv
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, eager_mask
 
+from int8_fq import fq_blocks, fq_static, rste, w_scale, wq_spec
+
 torch.set_num_threads(8)
 ap = argparse.ArgumentParser()
 ap.add_argument("assets")
@@ -54,6 +67,11 @@ ap.add_argument("--lr", type=float, default=1e-5)
 ap.add_argument("--eval-every", type=int, default=250)
 ap.add_argument("--eval-windows", type=int, default=4)
 ap.add_argument("--head-a16", action="store_true")
+ap.add_argument("--topk", type=int, default=0, help="the teacher's top-K precomputed (0: the teacher live)")
+ap.add_argument("--topk-cache", default=None, help="--topk: a file to keep the teacher's top-K in (reused)")
+ap.add_argument("--optim", choices=["adamw", "adamw-cpu", "adafactor"], default="adamw")
+ap.add_argument("--groups", type=int, default=1,
+                help="train the layers in this many interleaved groups, one a step (gradient memory / groups)")
 a = ap.parse_args()
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 T = 1023
@@ -73,62 +91,6 @@ def windows(path, n):
 
 test = windows(os.path.join(a.assets, "heldout_wikitext2_test.txt"), a.eval_windows)
 train_ids = torch.tensor(tok(open(a.train_text).read())["input_ids"])
-
-
-def rste(x):
-    return x + (torch.round(x) - x).detach()
-
-
-def fq_static(x, f, lo, hi):
-    """int8 static at exponent f (value = q * 2^-f), per-head f broadcast by the caller."""
-    s = torch.exp2(-f.to(x.dtype)) if torch.is_tensor(f) else 2.0 ** -f
-    return torch.clamp(rste(x / s), lo, hi) * s
-
-
-def fq_blocks(x, f, dmax=7, block=32):
-    """the producers' block rule (int8_spec.block_round_float): per block the largest shift d in
-    [0, dmax] whose rounded values fit [-128, 127]; straight through."""
-    sh = x.shape
-    n = sh[-1]
-    pad = (-n) % block
-    xp = F.pad(x, (0, pad)) if pad else x
-    B = xp.reshape(*xp.shape[:-1], -1, block)
-    with torch.no_grad():
-        Bd = B.detach()
-        d = torch.zeros(B.shape[:-1] + (1,), device=x.device, dtype=x.dtype)
-        for dd in range(1, dmax + 1):
-            r = torch.round(Bd * 2.0 ** (f + dd))
-            fits = ((r.amin(-1, keepdim=True) >= -128) & (r.amax(-1, keepdim=True) <= 127))
-            d = torch.where(fits, torch.full_like(d, dd), d)
-        s = torch.exp2(-(f + d))
-    q = torch.clamp(rste(B / s), -128, 127) * s
-    q = q.reshape(xp.shape)
-    return q[..., :n] if pad else q
-
-
-def w_scale(Wd):
-    """the spec's per-output-channel step 2^-f (rows of a torch Linear): candidates f0 (the finest
-    exponent at which max |w| rounds into 127), f0 + 1, f0 + 2; the least squared error."""
-    amax = Wd.abs().amax(1, keepdim=True).clamp_min(1e-30)
-    f0 = torch.floor(torch.log2(127.0 / amax))
-    f0 = torch.where(torch.round(amax * torch.exp2(f0)) > 127, f0 - 1, f0)
-    f0 = torch.where(torch.round(amax * torch.exp2(f0 + 1)) <= 127, f0 + 1, f0)
-    best_f, best_e = f0, None
-    for k in range(3):
-        f = f0 + k
-        e = ((torch.clamp(torch.round(Wd * torch.exp2(f)), -127, 127) * torch.exp2(-f) - Wd) ** 2).sum(1, keepdim=True)
-        if best_e is None:
-            best_e = e
-        else:
-            take = e < best_e
-            best_f, best_e = torch.where(take, f, best_f), torch.where(take, e, best_e)
-    return torch.exp2(-best_f)
-
-
-def wq_spec(W):
-    with torch.no_grad():
-        s = w_scale(W.detach())
-    return torch.clamp(rste(W / s), -127, 127) * s
 
 
 class QLinFn(torch.autograd.Function):
@@ -226,6 +188,39 @@ for p in teacher.parameters():
     p.requires_grad_(False)
 with torch.no_grad():
     sink = teacher(torch.tensor([[SINK]], device=DEV), use_cache=True).past_key_values
+rng = random.Random(1)
+starts = [[rng.randrange(len(train_ids) - a.seq) for _ in range(a.accum)] for _ in range(a.steps)]
+
+
+def teach(x):
+    return teacher(x, past_key_values=copy.deepcopy(sink), use_cache=True).logits[0]
+
+
+ref_argmax = None
+topk = None
+if a.topk:                                          # the teacher's answers, then the GPU is the student's
+    t1 = time.time()
+    key = dict(assets=os.path.abspath(a.assets), k=a.topk, seq=a.seq, accum=a.accum, steps=a.steps,
+               text=os.path.abspath(a.train_text), windows=a.eval_windows)
+    cached = torch.load(a.topk_cache) if a.topk_cache and os.path.exists(a.topk_cache) else None
+    if cached is not None and cached["key"] == key:
+        ref_argmax, topk = [r.to(DEV) for r in cached["ref_argmax"]], cached["topk"]
+    else:
+        with torch.no_grad():
+            ref_argmax = [teach(x[:, 1:])[:-1].argmax(-1) for x in test]
+            topk = []
+            for row in starts:
+                r = []
+                for i in row:      # the true log-probabilities of the K most likely (not renormalised)
+                    v, ix = torch.topk(F.log_softmax(teach(train_ids[i:i + a.seq][None].to(DEV)).float(), -1),
+                                       a.topk, -1)
+                    r.append((v.cpu(), ix.int().cpu()))
+                topk.append(r)
+        if a.topk_cache:
+            torch.save(dict(key=key, ref_argmax=[r.cpu() for r in ref_argmax], topk=topk), a.topk_cache)
+    del teacher
+    torch.cuda.empty_cache()
+    print(f"teacher top-{a.topk}: {sum(len(r) for r in topk)} windows [{time.time() - t1:.0f} s]", flush=True)
 student = load(True)
 
 
@@ -233,47 +228,90 @@ def evaluate():
     student.eval()
     nll, cnt, agree = 0.0, 0, 0
     with torch.no_grad():
-        for x in test:
+        for k, x in enumerate(test):
             lg = student(x[:, 1:], past_key_values=copy.deepcopy(sink), use_cache=True).logits[0][:-1]
-            ref = teacher(x[:, 1:], past_key_values=copy.deepcopy(sink), use_cache=True).logits[0][:-1]
+            ref = ref_argmax[k] if ref_argmax is not None else teach(x[:, 1:])[:-1].argmax(-1)
             nll += F.cross_entropy(lg, x[0, 2:], reduction="sum").item()
             cnt += lg.shape[0]
-            agree += (lg.argmax(-1) == ref.argmax(-1)).sum().item()
+            agree += (lg.argmax(-1) == ref).sum().item()
     student.train()
     return math.exp(nll / cnt), agree / cnt
 
 
 wparams = [m.weight for m in student.modules() if isinstance(m, QLin)]
+wgroups = [[m.weight for m in layer.modules() if isinstance(m, QLin)]
+           for layer in student.model.layers]                 # per layer, for --groups
 for p in student.parameters():
     p.requires_grad_(False)
 for p in wparams:
     p.requires_grad_(True)
-opt = torch.optim.AdamW(wparams, lr=a.lr, weight_decay=0.0)
+cpu_of = None
+if a.optim == "adafactor":
+    from transformers.optimization import Adafactor
+    opt = Adafactor(wparams, lr=a.lr, scale_parameter=False, relative_step=False, warmup_init=False,
+                    beta1=None, weight_decay=0.0)
+elif a.optim == "adamw-cpu":                        # AdamW's state and master weights in host RAM
+    cpu_of = {id(p): torch.nn.Parameter(p.detach().cpu().clone()) for p in wparams}
+    opt = torch.optim.AdamW(list(cpu_of.values()), lr=a.lr, weight_decay=0.0)
+else:
+    opt = torch.optim.AdamW(wparams, lr=a.lr, weight_decay=0.0)
+
+
+def opt_step():
+    if cpu_of is None:
+        opt.step()
+        return
+    for p in wparams:                               # the step's gradients down, the updated weights back
+        c = cpu_of[id(p)]
+        c.grad = None if p.grad is None else p.grad.detach().cpu()
+        p.grad = None
+    opt.step()
+    with torch.no_grad():
+        for p in wparams:
+            c = cpu_of[id(p)]
+            if c.grad is not None:
+                p.copy_(c.to(p.device, non_blocking=True))
+                c.grad = None
 log = dict(args=vars(a), evals=[])
 t0 = time.time()
 p0, g0 = evaluate()
 log["evals"].append(dict(step=0, ppl=p0, agree=g0))
 print(f"step 0 ppl {p0:.3f} agree {g0:.4f}", flush=True)
-rng = random.Random(1)
 WARM = 50
 for step in range(1, a.steps + 1):
     STEP[0] = step
     for g in opt.param_groups:
         g["lr"] = a.lr * min(1.0, step / WARM) * 0.5 * (1 + math.cos(math.pi * (step - 1) / a.steps))
-    opt.zero_grad()
+    opt.zero_grad(set_to_none=True)
+    for p in wparams:
+        p.grad = None
+    if a.groups > 1:                                # this step's layers: every groups-th from step % groups
+        for li, ps in enumerate(wgroups):
+            for p in ps:
+                p.requires_grad_(li % a.groups == step % a.groups)
     tot = 0.0
-    for _ in range(a.accum):
-        i = rng.randrange(len(train_ids) - a.seq)
+    for j, i in enumerate(starts[step - 1]):
         x = train_ids[i:i + a.seq][None].to(DEV)
-        with torch.no_grad():
-            tl = teacher(x, past_key_values=copy.deepcopy(sink), use_cache=True).logits[0]
         sl = student(x, past_key_values=copy.deepcopy(sink), use_cache=True).logits[0]
-        loss = F.kl_div(F.log_softmax(sl, -1), F.log_softmax(tl, -1), log_target=True, reduction="batchmean")
+        if topk is not None:
+            # the exact KL of the coarse distribution: the teacher's top K and one bucket for the
+            # rest (renormalising over the K would push the student's tail mass into them)
+            lt, ix = (t.to(DEV) for t in topk[step - 1][j])
+            ls = torch.gather(F.log_softmax(sl.float(), -1), 1, ix.long())
+            pt = lt.exp()
+            tail_t = (1.0 - pt.sum(-1)).clamp_min(1e-8)
+            tail_s = (1.0 - ls.exp().sum(-1)).clamp_min(1e-8)
+            loss = ((pt * (lt - ls)).sum(-1) + tail_t * (tail_t.log() - tail_s.log())).mean()
+        else:
+            with torch.no_grad():
+                tl = teach(x)
+            loss = F.kl_div(F.log_softmax(sl, -1), F.log_softmax(tl, -1), log_target=True, reduction="batchmean")
         (loss / a.accum).backward()
         tot += loss.item() / a.accum
-    opt.step()
+    opt_step()
     if step % 25 == 0:
-        print(f"step {step} kl {tot:.4f} [{time.time() - t0:.0f} s]", flush=True)
+        mem = f", GPU peak {torch.cuda.max_memory_allocated() / 2 ** 30:.2f} GiB" if DEV.type == "cuda" else ""
+        print(f"step {step} kl {tot:.4f} [{time.time() - t0:.0f} s{mem}]", flush=True)
     if step % a.eval_every == 0 or step == a.steps:
         p_, g_ = evaluate()
         log["evals"].append(dict(step=step, ppl=p_, agree=g_, kl=tot))

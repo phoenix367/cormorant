@@ -80,6 +80,8 @@ demo/image_classification/assets/labels/*
 !demo/image_classification/assets/labels/.gitkeep
 demo/image_classification/assets/preprocessed/*
 !demo/image_classification/assets/preprocessed/.gitkeep
+demo/image_classification/assets/imagenette
+demo/image_classification/assets/study/
 inference-scheduler/__pycache__/
 inference-scheduler/src/__pycache__/
 inference-scheduler/test/__pycache__/
