@@ -275,19 +275,23 @@ def duration_predictor(W, x_enc, noise_w, rng, fast=False):
 class Quant:
     """Exponent table + counters for one emulated run.  ``exp`` maps a tensor
     name to its power-of-two exponent f (value = raw * 2^-f); ``weights``:
-    "int16" (rank-1 encoding at f_w = f_y + 8 - f_x) or "float" (the +fw
-    bound).  ``bf16`` rounds tensors and weights to bfloat16 instead (the
+    "int16" (rank-1 encoding at f_w = f_y + 8 - f_x), "float" (the +fw
+    bound), "int8" (the 8-bit configuration, doc/plans/INT8_PLAN.md §9.12:
+    kconv8) or "w8a16" (int8 weights times the int16 input as it is: kconv8).  ``bf16`` rounds tensors and weights to bfloat16 instead (the
     yardstick)."""
 
     def __init__(self, exp: Dict[str, int], weights: str = "int16", bf16: bool = False,
-                 default: Optional[int] = None, host_chain: bool = False, dec_chain: bool = False):
+                 default: Optional[int] = None, host_chain: bool = False, dec_chain: bool = False,
+                 a16=()):
         self.exp, self.weights, self.bf16, self.default = exp, weights, bf16, default
+        self.a16 = tuple(a16)                 # int8: the convs (name prefixes) in the W8A16 mode
         self.host_chain = host_chain          # the flow's WN residual chain in float on the host
         self.dec_chain = dec_chain            # the decoder's residual chain in float on the host
         self.sat: Dict[str, int] = {}
         self.acc_peak = 0.0
         self.record: Optional[Dict[str, float]] = None        # calibration: name -> max |x|
         self.convs = None                                     # calibration: the convs' inputs
+        self.w8: Dict[str, tuple] = {}                        # int8: the encoded weights per conv
 
     def f(self, name):
         if name in self.exp:
@@ -357,6 +361,8 @@ def kconv(Q, name, x, xname, w, b, dil=1, pad=None, transpose=None):
         if Q.convs is not None:                              # calibration: keep a slice of the input
             Q.convs.append((name, x[:, :4096].copy(), w, b, dil, pad, transpose))
         return Q.kernel_out(name, y)
+    if Q.weights in ("int8", "w8a16"):
+        return kconv8(Q, name, x, xname, w, b, dil, pad, transpose)
     if Q.bf16:
         wq, bq = _bf16(w), None if b is None else _bf16(b)
     else:
@@ -368,6 +374,54 @@ def kconv(Q, name, x, xname, w, b, dil=1, pad=None, transpose=None):
         bq = None if b is None else np.clip(np.round(b * 2.0 ** fy), -32768, 32767) * 2.0 ** -fy
     y = conv_transpose1d(x, wq, bq, *transpose) if transpose else conv1d(x, wq, bq, dil=dil, pad=pad)
     return Q.kernel_out(name, y)
+
+
+def _s8():
+    """inference-scheduler/src/int8_spec.py: the 8-bit configuration's integer specification."""
+    import os
+    import sys
+    sched = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "inference-scheduler")
+    if sched not in sys.path:
+        sys.path.insert(0, sched)
+    from src import int8_spec
+    return int8_spec
+
+
+def kconv8(Q, name, x, xname, w, b, dil, pad, transpose):
+    """A conv on the 8-bit ConvKernel (doc/plans/INT8_PLAN.md §6): the input (int16 at its
+    exponent f_x, as the host / the previous conv wrote it) rounded to int8 blocks of 32 channels
+    at every time step, base f_x - 8; int8 weights per output channel (int8_spec.encode_weights);
+    the bias on the accumulator's grid; the exact sums (float64 of exact dyadic values); rne +
+    saturation to int16 at the output's exponent.  Q.weights "w8a16": the int16 input as it is
+    (one product per DSP: the W8A16 mode, INT8_PLAN §9.5), the accumulator at f_x + f_w."""
+    s8 = _s8()
+    if name + "#in" in Q.exp:                                # the host writes this conv's input
+        xname = name + "#in"
+        x = Q.q(xname, x)
+    fx, fy = Q.f(xname), Q.f(name)
+    if Q.weights == "w8a16" or name.startswith(Q.a16):
+        f8, xq = fx - s8.DELTA_MAX, x                        # g = f_x + f_w
+    else:
+        f8 = fx - 8
+        C = x.shape[0]
+        xt = np.pad(x.T, ((0, 0), (0, (-C) % s8.BLOCK)))
+        q, d = s8.block_round_float(xt, f8)
+        xq = s8.block_value(q, f8, d)[:, :C].T
+    if name not in Q.w8:
+        Q.w8[name] = s8.encode_weights(w, axis=1 if transpose else 0)
+    wq, fw = Q.w8[name]
+    sc = np.exp2(-fw.astype(np.float64))
+    wv = wq * (sc[None, :, None] if transpose else sc[:, None, None])
+    bq = None
+    if b is not None:
+        g = f8 + s8.DELTA_MAX + fw
+        bq = s8.bias_raw(b, g) * np.exp2(-g.astype(np.float64))
+    y = conv_transpose1d(xq, wv, bq, *transpose) if transpose else conv1d(xq, wv, bq, dil=dil, pad=pad)
+    r = np.round(y * 2.0 ** fy)
+    n = int(((r < -32768) | (r > 32767)).sum())
+    if n:
+        Q.sat[name] = Q.sat.get(name, 0) + n
+    return np.clip(r, -32768, 32767) * 2.0 ** -fy
 
 
 # ---- flow (reverse) and decoder --------------------------------------------- #

@@ -336,6 +336,10 @@ class VJEPA2(vs.VisionModel):
         self.grp = np.arange(cfg.H)
         self.stats = ls.Stats(cfg.NL)
         self.wsat = 0
+        self.i8 = self.q and bool(self.pol.get("i8"))     # the 8-bit kernels (doc/plans/INT8_PLAN.md §9.9)
+        self.i8_attn = self.i8 and self.pol.get("i8_attn", True)
+        self.i8_oblk = self.i8 and bool(self.pol.get("i8_oblk"))
+        self.i8cal = None                                  # an llm_study.I8Cal (i8_calibrator)
         g = lambda n: W[n].astype(np.float64)
         self.ln1, self.ln2, self.b = {}, {}, {}
         for l in cfg.attn_layers():
@@ -426,11 +430,18 @@ class VJEPA2(vs.VisionModel):
         H, HD = cfg.H, cfg.HD
         mask = np.ones((q.shape[0], k.shape[0]), bool)
         out = np.empty((q.shape[0], cfg.D))
+        if self.i8cal is not None:
+            for cls, t in (("q", q), ("k", k), ("vc", v)):
+                self.i8cal.add(cls, l, t.reshape(t.shape[0], H, HD))
         if self.q:
             fq, fk, fs = self.Eh("q", l, H), self.Eh("k", l, H), self.Eh("s", l, H)
             fp, fv, fpv = self.Eh("p", l, H), self.Ev("vc", l, cfg.D), self.Ev("pv", l, cfg.D)
         for h in range(H):
             sl = slice(h * HD, (h + 1) * HD)
+            if self.i8_attn:                        # llm_study's 8-bit head (INT8_PLAN §6.3)
+                out[:, sl] = self.attn8_head(q[:, sl], k[:, sl], v[:, sl], mask, fq[h], fk[h], fs[h], fv[sl],
+                                             fpv[sl], l, True, h, h)
+                continue
             if not self.q:
                 s = self.fmm(q[:, sl], k[:, sl].T, "s", l, rec=False)
                 if self.record_ch:
@@ -441,6 +452,8 @@ class VJEPA2(vs.VisionModel):
             s = self.kmm(q[:, sl] * p2(fq[h]), (k[:, sl] * p2(fk[h])).T, fs[h], 8, "s", l)
             p = self.softmax(s, mask, fs[h], fp[h], l)
             out[:, sl] = self.kmm(p * p2(fp[h]), v[:, sl] * p2v(fv[sl])[None, :], fpv[sl], 8, "pv", l)
+        if self.i8cal is not None:
+            self.i8cal.add("pv", l, out.reshape(out.shape[0], 1, cfg.D))
         return out
 
     def self_attention(self, x, l, rope):
@@ -587,6 +600,19 @@ POLICIES = {
     "pow2+p12+vgelu+vsmx+rowops+cf6": dict(_P, p_bits=12, ch_floor=6, **_UNITS, **_ROW),
     "pow2+p12+fw":                  dict(_P, p_bits=12, float_weights=True),  # diagnostic: float weights
 }
+
+
+def policy_spec(name):
+    """A POLICIES entry, or one followed by the 8-bit modifiers i8 / i8lin / i8ob
+    (llm_study.spec_with_mods; doc/plans/INT8_PLAN.md §9.9)."""
+    return ls.spec_with_mods(POLICIES, name)
+
+
+def i8_calibrator(cfg, ch):
+    """The 8-bit calibration's pass 2 (llm_study.I8Cal) over V-JEPA 2's attention layers:
+    VJEPA2.attend adds the data when ``i8cal`` is set; the classifier's input xc is blocked."""
+    return ls.I8Cal(ch, cfg, final=(("xc", "xc"),), final_layer=cfg.lk, src={"vc": "vc"},
+                    layers=cfg.attn_layers())
 
 
 def formats_json(fmt, name, pol):

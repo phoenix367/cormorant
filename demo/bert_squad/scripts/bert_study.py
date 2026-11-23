@@ -18,6 +18,15 @@ window:
             kernels).  bert_sched_check.py compares it bit for bit with the
             scheduler's own simulation.
   variants selected with --policies (see POLS in main()).
+  i8      — (policy ...+i8) the 8-bit configuration (doc/plans/INT8_PLAN.md
+            §9.10; inference-scheduler/src/int8_spec.py): the dense layers'
+            weights int8 per output column, their inputs int8 in blocks of 32
+            rounded from the Q8.8 tensors at a calibrated base, the bias in the
+            accumulator; q / K / V int8 static per head (the least-error
+            exponents), P int8 in blocks of 32 keys at 2^-6 from the softmax
+            unit's 2^-14; every kernel output rne to Q8.8 (the residual stream
+            and the LayerNorms stay Q8.8).  Calibrated on --calib examples
+            outside the evaluation set.
 
 Assets (not in git): demo/bert_squad/assets/vocab.txt (bert-base-uncased) and
 dev-v1.1.json (SQuAD 1.1 dev).  Run with inference-scheduler/.venv/bin/python.
@@ -121,9 +130,11 @@ _libm_exp = np.vectorize(math.exp, otypes=[np.float64])
 
 
 class Bert:
-    def __init__(self, path, pol=None, base=None):
+    def __init__(self, path, pol=None, base=None, i8fmt=None):
         pol = pol or {}
         self.pol = pol
+        self.i8 = bool(pol.get("i8"))
+        self.i8fmt = i8fmt or {}
         if base is None:
             m = onnx.load(path)
             self.g = m.graph
@@ -163,6 +174,15 @@ class Bert:
                 return np.clip(np.round(v.astype(np.float64) * sc), LO, HI) / sc
             return q_rnd(v)
         self.qinit = {k: qw(k, v) for k, v in self.init.items()}
+        self.prod = {o: n for n in self.nodes for o in n.output}
+        if self.i8:                                   # int8 weights per output column (Gemm B as [K, N])
+            s8 = _s8()
+            self.wq8 = {}
+            for n in self.nodes:
+                if n.op_type == "Gemm" and self.region[id(n)] == "kernel":
+                    a = {x.name: onnx.helper.get_attribute_value(x) for x in n.attribute}
+                    B = np.asarray(self.init[n.input[1]], np.float64)
+                    self.wq8[n.output[0]] = s8.encode_weights(B.T if a.get("transB", 0) else B, axis=1)
 
     def run(self, feeds, mode="float", policy=None, stats=None):
         q = mode != "float"
@@ -201,7 +221,9 @@ class Bert:
                     ln_done.add(reg)
                 continue
             ins = [env[i] if i else None for i in n.input]
-            if op == "Gemm":
+            if op == "Gemm" and q and self.i8 and n.output[0] in self.wq8:
+                outs = [self._gemm8(n, ins, a)]
+            elif op == "Gemm":
                 A, B = ins[0], ins[1]
                 if a.get("transA", 0): A = A.T
                 if a.get("transB", 0): B = B.T
@@ -215,6 +237,8 @@ class Bert:
                     y = A @ B
                     if len(ins) > 2 and ins[2] is not None: y = y + ins[2]
                 outs = [y]
+            elif op == "MatMul" and q and reg == "kernel" and self.i8 and n.input[1] not in self.init:
+                outs = [self._attn8(n, ins)]
             elif op == "MatMul":
                 if q and reg == "kernel":
                     acc = np.matmul(np.asarray(ins[0], np.float64), np.asarray(ins[1], np.float64))
@@ -240,7 +264,8 @@ class Bert:
                 x = ins[0]
                 raw = np.rint(np.asarray(x, np.float64) * 256.0).astype(np.int64).reshape(-1, x.shape[-1])
                 cm, cs = _vsmx().scale_regs(8, 1.0)
-                outs = [(_vsmx().softmax_raw(raw, raw.shape[1], cm, cs, 8) / 256.0).reshape(x.shape)]
+                fp = P8_SRC if q and self.i8 else 8      # 8-bit: P at 2^-14 for its blocks
+                outs = [(_vsmx().softmax_raw(raw, raw.shape[1], cm, cs, fp) / 2.0 ** fp).reshape(x.shape)]
             elif op == "Softmax":
                 x = ins[0]; ax = a.get("axis", 1)
                 xm = x - x.max(axis=ax, keepdims=True)
@@ -278,6 +303,8 @@ class Bert:
     def _quantize(self, n, name, v, reg, policy, stats):
         if reg == "move":
             return v
+        if self.i8 and n.op_type == "Softmax":          # P at 2^-14: P.V's blocks read it (_attn8)
+            return v
         leaves = any(self.region[id(c)] != reg for c in self.consumers.get(name, [])) or name in self.outputs
         if reg.startswith("cpu") and not leaves:
             return np.asarray(v, np.float64)        # stays inside a float host region
@@ -297,6 +324,95 @@ class Bert:
             return q_rnd(v * scale) / scale if scale != 1.0 else q_rnd(v)
         return q_trn(v)
 
+    # ---- the 8-bit configuration
+    def _gemm8(self, n, ins, a):
+        """A dense layer on the 8-bit kernels: the Q8.8 input rounded to int8 blocks of 32 at its
+        calibrated base, int8 weights per output column, the bias in the accumulator, rne to Q8.8."""
+        s8 = _s8()
+        A = np.asarray(ins[0], np.float64)
+        assert not a.get("transA", 0)
+        wq, fw = self.wq8[n.output[0]]
+        E = int(self.i8fmt[("in", n.input[0])])
+        xq, xd = s8.block_round(np.rint(A * 256.0).astype(np.int64), 8 - E)
+        acc, g = s8.matmul(xq, E, xd, wq, fw, acc_bits=63)
+        if len(ins) > 2 and ins[2] is not None:
+            acc = acc + s8.bias_raw(np.asarray(ins[2], np.float64) * a.get("beta", 1.0), g)
+        return s8.requant(acc, g, 8, LO, HI) / 256.0
+
+    def _attn8(self, n, ins):
+        """q.K^T / P.V on the 8-bit kernels, per head: q int8 [-128, 127], K and V int8 [-127, 127]
+        at their least-error exponents (q8 / k8 / v8 of this MatMul), P int8 in blocks of 32 keys at
+        2^-6 from 2^-14; the sums exact; rne to Q8.8."""
+        s8 = _s8()
+        A, B = (np.asarray(x, np.float64) for x in ins)
+        out = np.empty(A.shape[:-1] + B.shape[-1:])
+        pv = self.prod[n.input[0]].op_type == "Softmax"
+        for h in range(A.shape[1]):
+            if pv:
+                P8, Pd = s8.block_round(np.rint(A[0, h] * 2.0 ** P8_SRC).astype(np.int64), P8_SRC - P8_BASE)
+                fv = int(self.i8fmt[("v8", n.output[0])][h])
+                v8 = np.clip(np.rint(B[0, h] * 2.0 ** fv), -127, 127).astype(np.int64)
+                acc, g = s8.matmul(P8, P8_BASE, Pd, v8, np.full(B.shape[-1], fv), acc_bits=63)
+            else:
+                fq, fk = int(self.i8fmt[("q8", n.output[0])][h]), int(self.i8fmt[("k8", n.output[0])][h])
+                q8 = np.clip(np.rint(A[0, h] * 2.0 ** fq), -128, 127).astype(np.int64)
+                k8 = np.clip(np.rint(B[0, h] * 2.0 ** fk), -127, 127).astype(np.int64)
+                acc, g = s8.matmul(q8, fq, 0, k8, np.full(B.shape[-1], fk), acc_bits=63)
+            out[0, h] = s8.requant(acc, g, 8, LO, HI) / 256.0
+        return out
+
+
+def i8_calibrate(bert, examples):
+    """The 8-bit formats from float runs over ``examples`` (feeds): each dense layer input's
+    block base (the int8 exponent of its maximum: ("in", tensor)); per head the least-error int8
+    exponents of q / K (("q8" / "k8", MatMul output)) and V (("v8", ...)) — llm_study.I8Sse's two
+    passes."""
+    s8 = _s8()
+    sys.path.insert(0, os.path.join(REPO, "demo", "chat", "scripts"))
+    import llm_study as ls
+    dense = [n for n in bert.nodes if n.op_type == "Gemm" and bert.region[id(n)] == "kernel"]
+    attn = [n for n in bert.nodes if n.op_type == "MatMul" and bert.region[id(n)] == "kernel"
+            and n.input[1] not in bert.init]
+
+    def operands(env, n):                         # [rows, heads, n] per static operand
+        A, B = np.asarray(env[n.input[0]], np.float64)[0], np.asarray(env[n.input[1]], np.float64)[0]
+        if bert.prod[n.input[0]].op_type == "Softmax":
+            return {"v8": (B.transpose(1, 0, 2), -127)}
+        return {"q8": (A.transpose(1, 0, 2), -128), "k8": (B.transpose(2, 0, 1), -127)}
+    amax, hmax = {}, {}
+    for feeds in examples:
+        env = bert.run(feeds, "float")
+        for n in dense:
+            amax[n.input[0]] = max(amax.get(n.input[0], 0.0), float(np.abs(env[n.input[0]]).max()))
+        for n in attn:
+            for c, (x, _) in operands(env, n).items():
+                m = np.abs(x).max(axis=(0, 2))
+                hmax[(c, n.output[0])] = np.maximum(hmax.get((c, n.output[0]), m), m)
+    sse = ls.I8Sse()
+    for n in attn:
+        for c in (("v8",) if bert.prod[n.input[0]].op_type == "Softmax" else ("q8", "k8")):
+            sse.group((c, n.output[0]), hmax[(c, n.output[0])], -127 if c != "q8" else -128, 127)
+    for feeds in examples:
+        env = bert.run(feeds, "float")
+        for n in attn:
+            for c, (x, _) in operands(env, n).items():
+                sse.add_key((c, n.output[0]), x)
+    fmt = dict(sse.best())
+    for t, m in amax.items():
+        fmt[("in", t)] = s8.base_exponent(m)
+    return fmt
+
+
+P8_BASE, P8_SRC = 6, 14             # P's int8 blocks (llm_study.Model.P8_BASE / P8_SRC)
+
+
+def _s8():
+    """inference-scheduler/src/int8_spec.py: the 8-bit configuration's integer specification."""
+    sys.path.insert(0, os.path.join(REPO, "inference-scheduler"))
+    from src import int8_spec
+    return int8_spec
+
+
 # ----------------------------------------------------------------- policies
 POLS = {
     "q88":        {},
@@ -309,6 +425,8 @@ POLS = {
     # + every LayerNorm as the row-ops unit's integer LayerNorm (HOSTOPS_PLAN §5:
     # inference-scheduler/src/rowops_spec.layer_norm on the Q8.8 residual-add output)
     "sched+vsmx+iln": {"sched": 1, "vsmx": 1, "iln": 1},
+    # + the 8-bit configuration (doc/plans/INT8_PLAN.md §9.10: Bert._gemm8 / _attn8)
+    "sched+vsmx+iln+i8": {"sched": 1, "vsmx": 1, "iln": 1, "i8": 1},
 }
 
 
@@ -341,7 +459,10 @@ def pick_examples(n):
             if len(exs) >= 4 * n: break
         if len(exs) >= 4 * n: break
     rng = np.random.default_rng(0)
-    return tok, [exs[i] for i in sorted(rng.choice(len(exs), n, replace=False))]
+    pick = sorted(rng.choice(len(exs), n, replace=False))
+    rest = [exs[i] for i in range(len(exs)) if i not in set(pick)]
+    pick_examples.rest = rest                   # the pool's other examples: the 8-bit calibration's
+    return tok, [exs[i] for i in pick]
 
 
 def feeds_of(f):
@@ -354,6 +475,7 @@ def main():
     ap.add_argument("--n", type=int, default=40)
     ap.add_argument("--check-ort", action="store_true")
     ap.add_argument("--policies", default="q88,fused,fused+w,fused+w+p7,fused+fw")
+    ap.add_argument("--calib", type=int, default=16, help="8-bit calibration examples (outside the evaluation set)")
     args = ap.parse_args()
     fetch_assets.ensure_all(MODEL, HERE)
     tok, pick = pick_examples(args.n)
@@ -369,7 +491,12 @@ def main():
         print("ORT vs numpy float max|diff| start %.2e end %.2e" % (
             np.abs(r[0] - env["unstack:0"]).max(), np.abs(r[1] - env["unstack:1"]).max()))
     sel = args.policies.split(",")
-    models = {k: Bert(MODEL, POLS[k], base=bert) for k in sel}
+    i8fmt = None
+    if any(POLS[k].get("i8") for k in sel):
+        t0 = time.time()
+        i8fmt = i8_calibrate(bert, [feeds_of(f) for _, f in pick_examples.rest[:args.calib]])
+        print(f"8-bit calibration: {args.calib} examples, {time.time() - t0:.0f} s", flush=True)
+    models = {k: Bert(MODEL, POLS[k], base=bert, i8fmt=i8fmt if POLS[k].get("i8") else None) for k in sel}
     tot = collections.Counter(); stats = {k: {} for k in sel}
     t0 = time.time()
     for k_ex, (qa, f) in enumerate(pick):

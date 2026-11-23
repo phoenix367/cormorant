@@ -140,14 +140,38 @@ def block_round(A, k, block: int = BLOCK, dmax: int = DELTA_MAX,
     elements saturate.  Returns (q [..., N], d [..., N / block])."""
     A = np.asarray(A, dtype=np.int64)
     kk = np.broadcast_to(np.asarray(k, dtype=np.int64), A.shape)
-    d_best = np.zeros(A.shape[:-1] + (A.shape[-1] // block,), dtype=np.int64)
-    for d in range(1, dmax + 1):
-        r = _blocks(rne_shr(A, kk - d), block)
-        fits = (r.min(axis=-1) >= lo) & (r.max(axis=-1) <= hi)
-        d_best = np.where(fits, d, d_best)
+    if dmax == 0:
+        d_best = np.zeros(A.shape[:-1] + (A.shape[-1] // block,), dtype=np.int64)
+    elif A.size == 0 or (A.max() < 2 ** 53 and A.min() > -(2 ** 53)):
+        d_best = _block_shifts(np.ldexp(A.astype(np.float64), -kk), block, dmax, lo, hi)   # A * 2^-k: exact
+    else:                                              # beyond float64's integers: each shift in turn
+        d_best = np.zeros(A.shape[:-1] + (A.shape[-1] // block,), dtype=np.int64)
+        for d in range(1, dmax + 1):
+            r = _blocks(rne_shr(A, kk - d), block)
+            fits = (r.min(axis=-1) >= lo) & (r.max(axis=-1) <= hi)
+            d_best = np.where(fits, d, d_best)
     dk = np.repeat(d_best, block, axis=-1)
     q = np.clip(rne_shr(A, kk - dk), lo, hi)
     return q, d_best
+
+
+def _block_shifts(y, block: int, dmax: int, lo: int, hi: int) -> np.ndarray:
+    """d per block of y [..., N] (float64): the largest d in [1, dmax] at which every
+    rne(y * 2^d) of the block lies in [lo, hi], else 0.  rne is monotone, so a block fits
+    where its extremes do, and rne(t) <= hi exactly when t < hi + 1/2 (or t = hi + 1/2 for
+    an even hi, the tie rounding down to it), rne(t) >= lo when t > lo - 1/2 (or = for an
+    even lo); y * 2^d is exact — the rule of block_round's definition, one pass over y
+    instead of one per shift."""
+    yb = _blocks(y, block)
+    ymax, ymin = yb.max(axis=-1), yb.min(axis=-1)
+    up, dn = hi + 0.5, lo - 0.5
+    d_best = np.zeros(ymax.shape, dtype=np.int64)
+    for d in range(1, dmax + 1):
+        t_hi, t_lo = np.ldexp(ymax, d), np.ldexp(ymin, d)
+        fits = (((t_hi < up) | ((t_hi == up) & (hi % 2 == 0)))
+                & ((t_lo > dn) | ((t_lo == dn) & (lo % 2 == 0))))
+        d_best = np.where(fits, d, d_best)
+    return d_best
 
 
 def block_round_float(x, f: int, block: int = BLOCK, dmax: int = DELTA_MAX,
@@ -155,11 +179,10 @@ def block_round_float(x, f: int, block: int = BLOCK, dmax: int = DELTA_MAX,
     """The same rule for a producer that computes in double (a host op, the
     studies' calibration): rne(x * 2^(f + d))."""
     x = np.asarray(x, dtype=np.float64)
-    d_best = np.zeros(x.shape[:-1] + (x.shape[-1] // block,), dtype=np.int64)
-    for d in range(1, dmax + 1):
-        r = _blocks(rne_float(x * 2.0 ** (f + d)), block)
-        fits = (r.min(axis=-1) >= lo) & (r.max(axis=-1) <= hi)
-        d_best = np.where(fits, d, d_best)
+    if dmax == 0:
+        d_best = np.zeros(x.shape[:-1] + (x.shape[-1] // block,), dtype=np.int64)
+    else:
+        d_best = _block_shifts(x * 2.0 ** f, block, dmax, lo, hi)
     dk = np.repeat(d_best, block, axis=-1)
     q = np.clip(rne_float(x * np.exp2(f + dk)), lo, hi)
     return q, d_best

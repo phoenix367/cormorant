@@ -291,6 +291,9 @@ def _worker(k):
         out["xf_rel"] = rel(tr["xf"], ref[k]["xf"])
     if m.record_ch:
         out["ch"] = m.stats.ch
+    if m.i8cal is not None:                         # the 8-bit calibration's squared errors, this clip
+        out["sse"] = m.i8cal.sse
+        m.i8cal.sse = {k: np.zeros_like(v) for k, v in m.i8cal.sse.items()}
     return out
 
 
@@ -358,6 +361,20 @@ def calibrate(cfg, W, KW, assets, jobs, log):
     return ch
 
 
+def i8_formats(cfg, W, KW, ch, assets, jobs, log):
+    """The 8-bit calibration's pass 2 (vjepa2_q.i8_calibrator) over the calibration clips in
+    the workers; their squared errors summed -> the 8-bit formats."""
+    t0 = time.time()
+    m = vq.VJEPA2(cfg, W, KW=KW)
+    m.i8cal = vq.i8_calibrator(cfg, ch)
+    outs = run_model(m, load_samples(assets, "calibration"), jobs, log=log, tag="8-bit calibration")
+    for o in outs:
+        for k, v in o["sse"].items():
+            m.i8cal.sse[k] = m.i8cal.sse[k] + v
+    log(f"  8-bit calibration {time.time() - t0:.0f} s")
+    return m.i8cal.formats()
+
+
 def cmd_study(args):
     out_dir = args.out or study_dir(args.assets)
     os.makedirs(out_dir, exist_ok=True)
@@ -383,10 +400,15 @@ def cmd_study(args):
     results = {"float": dict(metrics=metrics(ref, ref, samples), stats=merge_stats(ref))}
     logits = {"float": [o["logits"].tolist() for o in ref]}
     fmts = {}
+    i8fmt = None
     for name in names:
-        pol = vq.POLICIES[name]
+        pol = vq.policy_spec(name)
         t1 = time.time()
         fmt = vq.make_formats(pol, ch, KW, cfg)
+        if pol.get("i8"):
+            if i8fmt is None:
+                i8fmt = i8_formats(cfg, W, KW, ch, args.assets, args.jobs, log)
+            fmt.update(i8fmt)
         fmts[name] = fmt
         m = vq.VJEPA2(cfg, W, pol, fmt, KW=KW)
         outs = run_model(m, samples, args.jobs, ref=ref, log=log, tag=name)
@@ -399,7 +421,7 @@ def cmd_study(args):
             f"encoder rel {mt['xf']['mean']:.4f}  pooled rel {mt['pooled']['mean']:.4f}  acc {mt['acc']['mean']:.3f}  "
             f"{time.time() - t1:.0f} s")
     json.dump(dict(results=results, samples=[s.idx for s in samples], labels=[s.label for s in samples],
-                   logits=logits, formats={k: vq.formats_json(f, k, vq.POLICIES[k]) for k, f in fmts.items()}),
+                   logits=logits, formats={k: vq.formats_json(f, k, vq.policy_spec(k)) for k, f in fmts.items()}),
               open(os.path.join(out_dir, "results.json"), "w"))
     report(results, log)
     log(f"total {time.time() - t0:.0f} s")

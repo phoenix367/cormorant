@@ -383,6 +383,12 @@ def _worker_run(job):
                wsat={p: getattr(m, p).wsat for p in ("vision", "text", "expert")})
     if m.vision.record_ch:
         out["ch"] = {p: getattr(m, p).stats.ch for p in ("vision", "text", "expert")}
+    if m.text.i8cal is not None:                    # the 8-bit calibration's squared errors, this sample
+        out["sse"] = {}
+        for p in ("vision", "text", "expert"):
+            c = getattr(m, p).i8cal
+            out["sse"][p] = c.sse
+            c.sse = {key: np.zeros_like(v) for key, v in c.sse.items()}
     return out
 
 
@@ -411,6 +417,21 @@ def calibrate(cfg, W, KW, tok, assets, jobs, cs, log):
     ch = merge_ch(run_model(m, cfg, cal, tok, jobs))
     log(f"  calibration: {len(cal)} samples, {time.time() - t0:.0f} s")
     return ch
+
+
+def i8_formats(cfg, W, KW, tok, ch, assets, jobs, cs, log):
+    """The 8-bit calibration's pass 2 (smolvla_q.i8_calibrators) over the calibration samples in
+    the workers; their squared errors summed -> the 8-bit formats {vision, text, expert}."""
+    t0 = time.time()
+    m = sq.SmolVLA(cfg, W, KW=KW, cos_sin=cs)
+    sq.i8_calibrators(m, ch)
+    for o in run_model(m, cfg, load_samples(assets, "calibration"), tok, jobs):
+        for p, d in o["sse"].items():
+            c = getattr(m, p).i8cal
+            for key, v in d.items():
+                c.sse[key] = c.sse[key] + v
+    log(f"  8-bit calibration {time.time() - t0:.0f} s")
+    return sq.i8_formats(m)
 
 
 def metrics(outs, ref, samples, cfg):
@@ -484,10 +505,16 @@ def cmd_study(args):
         log(f"  lerobot bf16 {time.time() - t0:.0f} s")
     names = args.policies.split(",") if args.policies else [p for p in sq.POLICIES if p != "float"]
     fmts = {}
+    i8fmt = None
     for name in names:
-        pol = sq.POLICIES[name]
+        pol = sq.policy_spec(name)
         t1 = time.time()
         fmt = sq.make_formats(pol, ch["vision"], ch["text"], ch["expert"], cfg, KW, W)
+        if pol["text"].get("i8"):
+            if i8fmt is None:
+                i8fmt = i8_formats(cfg, W, KW, tok, ch, args.assets, args.jobs, cs, log)
+            for p in fmt:
+                fmt[p].update(i8fmt[p])
         fmts[name] = fmt
         m = sq.SmolVLA(cfg, W, pol, fmt, KW=KW, cos_sin=cs)
         outs = run_model(m, cfg, samples, tok, args.jobs)

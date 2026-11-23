@@ -135,6 +135,15 @@ class Num:
     concats at the coarser operand exponent (the finer operand rescaled with a
     floor, a VectorOP MUL by 2^-k), a MUL at f_a + f_b - 8.
 
+    'i8' (after pow2): the 8-bit configuration (doc/plans/INT8_PLAN.md §9.13) —
+    every conv on the 8-bit ConvKernel (``conv8``): its input rounded to int8
+    blocks of 32 channels at every pixel (base f_x - 8), int8 weights per output
+    channel, the bias on the accumulator's grid, rne at f_y; the other ops int16.
+    'i8@<stage>' (repeatable): only that stage's convs 8-bit, the others int16.
+    'dwc' (with i8): a depthwise conv's input static int8 per channel, at its calibrated
+    per-channel maximum, instead of blocks of 32 channels; 'stem16': the stem conv in the
+    W8A16 mode (what folding the normalisation into it gives: the uint8 pixels exact).
+
     Ablation options, '+'-separated after the base: 'fw' keeps the weights
     float; 'x<stage>' keeps a stage exact; 'o<stage>' rounds only that stage
     (stages: input, backbone, fpn, correlation, aggregation, attention,
@@ -149,6 +158,11 @@ class Num:
         self.pc = "pc" in opts or "pc5" in opts   # per-output-channel weight exponents (+ a rescale)
         self.pc_min = 0.05 if "pc5" in opts else 0.0  # pc5: only where per-tensor rounding loses > 5 %
         self.hmul = "hmul" in opts     # the attention MUL on the host, at its calibrated exponent
+        self.i8 = "i8" in opts         # the 8-bit ConvKernel (conv8)
+        self.i8_stages = {o[3:] for o in opts if o.startswith("i8@")}
+        self.dwc = "dwc" in opts       # i8: a depthwise conv's input static per channel (conv8)
+        self.stem16 = "stem16" in opts  # i8: the stem conv in the W8A16 mode (the image exact)
+        self._w8 = {}
         self.calib = base == "calib"
         self.pow2 = base == "pow2"
         self.table = table or {}
@@ -213,17 +227,60 @@ class Num:
             out[c] = torch.round(t[c] * 2 ** fwc) / 2 ** fwc
         return out
 
+    def conv8(self, x, w, b, fx, fy, site, transposed=False, **kw):
+        """A conv on the 8-bit ConvKernel (the class docstring's 'i8'); the output rounded half to
+        even at fy (int16).  kw: F.conv2d / conv_transpose2d's stride, padding, groups, ..."""
+        s8 = _s8()
+        f8 = fx - 8
+        xt = x.permute(0, 2, 3, 1).numpy()
+        C = xt.shape[-1]
+        cmax = self.table.get(str(getattr(x, "site", None)) + ":c")
+        if self.stem16 and site == "backbone.conv_stem":
+            xq, f8 = x, fx - s8.DELTA_MAX              # W8A16: the int16 image as it is (g = f_x + f_w)
+        elif self.dwc and kw.get("groups", 1) == C > 1 and cmax is not None:
+            # a depthwise conv's input: static int8 per channel at its calibrated maximum (each
+            # output channel reads one input channel: the exponent folds into its output shift)
+            u = bool(getattr(x, "unsigned", False))
+            fc = np.array([s8.base_exponent(m / 2.0 if u else m) for m in cmax], np.int64)
+            sc = np.exp2(fc.astype(np.float64))
+            q = np.clip(np.rint(xt * sc), 0 if u else -128, 255 if u else 127)
+            xq = torch.from_numpy(q / sc).permute(0, 3, 1, 2).contiguous()
+        else:
+            q, d = s8.block_round_float(np.pad(xt, ((0, 0), (0, 0), (0, 0), (0, (-C) % s8.BLOCK))), f8)
+            xq = torch.from_numpy(s8.block_value(q, f8, d)[..., :C]).permute(0, 3, 1, 2).contiguous()
+        key = (site, tuple(w.shape))
+        if key not in self._w8:
+            self._w8[key] = s8.encode_weights(w.numpy(), axis=1 if transposed else 0)
+        wq, fw = self._w8[key]
+        sc = np.exp2(-fw.astype(np.float64))
+        wv = torch.from_numpy(wq * (sc[None, :, None, None] if transposed else sc[:, None, None, None]))
+        bq = None
+        if b is not None:
+            g = f8 + s8.DELTA_MAX + fw
+            bq = torch.from_numpy(s8.bias_raw(b.numpy(), g) * np.exp2(-g.astype(np.float64)))
+        y = F.conv_transpose2d(xq, wv, bq, **kw) if transposed else F.conv2d(xq, wv, bq, **kw)
+        return self.host(y, fy, site)
+
+    def on8(self) -> bool:                  # this conv on the 8-bit ConvKernel
+        return self.on() and (self.i8 or self.stage in self.i8_stages)
+
     def kernel(self, t, f=8, site=None):    # a kernel output: floor(acc / 2^8)
         self.record(site, t)
         if self.on() and self.bf16:
             return tag(t.to(torch.bfloat16).double(), f)
-        return tag(self._sat(torch.floor(t * 2 ** f) / 2 ** f, f) if self.on() else t, f)
+        out = tag(self._sat(torch.floor(t * 2 ** f) / 2 ** f, f) if self.on() else t, f)
+        if site:
+            out.site = site
+        return out
 
     def host(self, t, f=8, site=None):      # a host op / VectorOP rounded output: half to even
         self.record(site, t)
         if self.on() and self.bf16:
             return tag(t.to(torch.bfloat16).double(), f)
-        return tag(self._sat(torch.round(t * 2 ** f) / 2 ** f, f) if self.on() else t, f)
+        out = tag(self._sat(torch.round(t * 2 ** f) / 2 ** f, f) if self.on() else t, f)
+        if site:
+            out.site = site
+        return out
 
     def requant(self, t, f):                # to a coarser exponent: floor (VectorOP MUL by 2^-k)
         if not self.on() or self.bf16 or getattr(t, "f", f) <= f:
@@ -247,6 +304,15 @@ class Num:
         f = getattr(a, "f", 8) + getattr(b, "f", 8) - 8
         y = self.kernel(a * b, f, site)
         return self.requant(y, min(f, self.exp(site, f))) if site else y
+
+
+def _s8():
+    """inference-scheduler/src/int8_spec.py: the 8-bit configuration's integer specification."""
+    sched = str(Path(__file__).resolve().parents[3] / "inference-scheduler")
+    if sched not in sys.path:
+        sys.path.insert(0, sched)
+    from src import int8_spec
+    return int8_spec
 
 
 # ── the model, functional ─────────────────────────────────────────────────────
@@ -298,6 +364,15 @@ class LightStereoF:
         fy = 8 if act == "relu6" and not n.r6 else n.exp(conv)
         if cap is not None:
             fy = min(fy, cap)
+        if n.on8():
+            if transposed:
+                macs = x.numel() * w.shape[1] * w.shape[2] * w.shape[3]
+                y = n.conv8(x, w, b, fx, fy, conv, True, stride=stride, padding=pad, output_padding=out_pad)
+            else:
+                y = n.conv8(x, w, b, fx, fy, conv, stride=stride, padding=pad, groups=groups)
+                macs = y.numel() * (w.shape[1] * w.shape[2] * w.shape[3])
+            self.macs[self.stage] = self.macs.get(self.stage, 0) + macs
+            return self.act(y, act)
         wq = n.w(w, fy + 8 - fx)
         if n.pc and n.on() and not n.fw and groups == 1 and \
                 float((wq - w).norm() / max(float(w.norm()), 1e-12)) > n.pc_min:
@@ -321,10 +396,10 @@ class LightStereoF:
 
     def act(self, y, act):
         f = getattr(y, "f", 8)
-        if act == "relu":
-            return tag(F.relu(y), f)
-        if act == "relu6":
-            return tag(y.clamp(0, 6), f)
+        if act in ("relu", "relu6"):            # the site's per-channel maxima still bound it (conv8)
+            t = tag(F.relu(y) if act == "relu" else y.clamp(0, 6), f)
+            t.site, t.unsigned = getattr(y, "site", None), True
+            return t
         if act is not None and act.startswith("leaky"):
             return self.n.host(F.leaky_relu(y, float(act[5:]) if len(act) > 5 else 0.01), f)
         return y
@@ -342,6 +417,11 @@ class LightStereoF:
         b = self.sd[conv + ".bias"]
         k = w.shape[3] if horizontal else w.shape[2]
         fx, fy = getattr(x, "f", 8), self.n.exp(conv)
+        if self.n.on8():                             # one 8-bit conv (the int16 tap pieces not modelled)
+            y = self.n.conv8(x, w, b, fx, fy, conv, padding=(0, k // 2) if horizontal else (k // 2, 0),
+                             groups=x.shape[1])
+            self.macs[self.stage] = self.macs.get(self.stage, 0) + y.numel() * k
+            return y
         if k <= self.stripe_max:
             y = F.conv2d(x, self.n.w(w, fy + 8 - fx), self.n.w(b, fy),
                          padding=(0, k // 2) if horizontal else (k // 2, 0), groups=x.shape[1])

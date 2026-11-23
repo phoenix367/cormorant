@@ -502,13 +502,38 @@ class Stats:
 I8_CAND = 8            # candidate int8 exponents: the calibration maximum's and 7 finer (clipping) ones
 
 
-class I8Cal:
-    """The static 8-bit operands' exponents (doc/plans/INT8_PLAN.md §6): q per head, the K / V
-    caches per KV head, the o projection's input (P.V's output) per tensor.  From the float
-    calibration's per-channel maxima (pass 1) the int8 exponent that does not clip; then, over
-    the calibration text again, the squared error of rounding at that exponent and the 7 finer
-    ones (pass 2, ``add``); ``formats``: the least-error candidate per group, as the format
-    classes q8 / k8 / vc8 / pv8, and the blocked inputs' int16 exponents (BLOCKED, xf)."""
+class I8Sse:
+    """Least-error static int8 exponents (doc/plans/INT8_PLAN.md §6), one per group of a key:
+    from the float calibration's maxima (``group``) the int8 exponent that does not clip; then, over
+    the calibration data again, the squared error of rounding at that exponent and the I8_CAND - 1
+    finer ones (``add_key``); ``best``: the least-error candidate per group."""
+
+    def __init__(self):
+        self.f8max, self.sse, self.lim = {}, {}, {}
+
+    def group(self, key, maxima, lo=-128, hi=127):
+        s8 = i8spec()
+        self.f8max[key] = np.array([s8.base_exponent(float(m)) for m in np.ravel(maxima)], np.int64)
+        self.sse[key] = np.zeros((len(self.f8max[key]), I8_CAND))
+        self.lim[key] = (lo, hi)
+
+    def add_key(self, key, x):                         # x [rows, groups, n] (float values)
+        f0 = self.f8max[key]
+        lo, hi = self.lim[key]
+        for c in range(I8_CAND):
+            sc = p2(f0 + c)[None, :, None]
+            r = np.clip(np.rint(x * sc), lo, hi) / sc
+            self.sse[key][:, c] += ((r - x) ** 2).sum(axis=(0, 2))
+
+    def best(self):
+        return {k: self.f8max[k] + self.sse[k].argmin(axis=1) for k in self.sse}
+
+
+class I8Cal(I8Sse):
+    """The static 8-bit operands' exponents (I8Sse): q per head, the K / V caches per KV head,
+    the o projection's input (P.V's output) per tensor; ``add`` over the calibration text;
+    ``formats``: the least-error candidates as the format classes q8 / k8 / vc8 / pv8, and the
+    blocked inputs' int16 exponents (BLOCKED, xf)."""
     RANGE = {"q": (-128, 127), "k": (-127, 127), "vc": (-127, 127), "pv": (-128, 127)}
 
     # the blocked inputs of the linears (the RMSNorm / SiLU * up outputs): their int16 exponent
@@ -516,36 +541,42 @@ class I8Cal:
     # grid finer than any block's (the int16 formats cap these classes at 8 for the int16 weights'
     # sake, which the 8-bit weights, per output channel, do not need)
     BLOCKED = ("x", "x2", "a")
+    SRC = {"q": "q", "k": "k", "vc": "v", "pv": "pv"}     # the float classes of the static operands
 
-    def __init__(self, ch, cfg):
+    def __init__(self, ch, cfg, blocked=None, final=(("xf", "xf"),), src=None, layers=None, final_layer=None):
+        """``blocked``: the blocked input classes per layer (BLOCKED); ``final``: (format class,
+        float class) pairs of the blocked inputs at layer ``final_layer`` (cfg.L: the LM head's
+        xf; the vision connector's xs, which is xf rearranged); ``src``: the float classes of q /
+        k / vc / pv (SRC; the vision encoder records V after its bias as vc); ``layers``: the
+        attention layers (range(cfg.L))."""
+        super().__init__()
         s8 = i8spec()
-        self.f8max, self.sse = {}, {}
+        layers = list(range(cfg.L)) if layers is None else list(layers)
         self.base16 = {}
-        for l in range(cfg.L):
-            for cls in self.BLOCKED:
-                self.base16[(cls, l)] = s8.base_exponent(float(np.max(ch[(cls, l)]))) + 8
-        self.base16[("xf", cfg.L)] = s8.base_exponent(float(np.max(ch[("xf", cfg.L)]))) + 8
-        for l in range(cfg.L):                     # i8ob: the o input's block base (int8)
-            self.base16[("pvb", l)] = s8.base_exponent(float(np.max(ch[("pv", l)])))
+        for l in layers:
+            for cls in (self.BLOCKED if blocked is None else blocked):
+                if (cls, l) in ch:                 # (a layer without it: SmolVLA's last VLM layer)
+                    self.base16[(cls, l)] = s8.base_exponent(float(np.max(ch[(cls, l)]))) + 8
+        fl = cfg.L if final_layer is None else final_layer
+        for cls, fcls in final:
+            self.base16[(cls, fl)] = s8.base_exponent(float(np.max(ch[(fcls, fl)]))) + 8
+        for l in layers:                           # i8ob: the o input's block base (int8)
+            if ("pv", l) in ch:
+                self.base16[("pvb", l)] = s8.base_exponent(float(np.max(ch[("pv", l)])))
         groups = {"q": cfg.H, "k": cfg.KV, "vc": cfg.KV, "pv": 1}
-        src = {"q": "q", "k": "k", "vc": "v", "pv": "pv"}
-        for l in range(cfg.L):
+        src = dict(self.SRC, **(src or {}))
+        for l in layers:
             for cls, n in groups.items():
-                mx = np.asarray(ch[(src[cls], l)], np.float64).reshape(n, -1).max(axis=1)
-                self.f8max[(cls, l)] = np.array([s8.base_exponent(float(m)) for m in mx], np.int64)
-                self.sse[(cls, l)] = np.zeros((n, I8_CAND))
+                key = (src[cls], l) if (src[cls], l) in ch else (cls, l)   # (SmolVLA's cross V': vc)
+                if key in ch:
+                    self.group((cls, l), np.asarray(ch[key], np.float64).reshape(n, -1).max(axis=1),
+                               *self.RANGE[cls])
 
     def add(self, cls, l, x):                          # x [rows, groups, n] (float values)
-        f0 = self.f8max[(cls, l)]
-        lo, hi = self.RANGE[cls]
-        for c in range(I8_CAND):
-            sc = p2(f0 + c)[None, :, None]
-            r = np.clip(np.rint(x * sc), lo, hi) / sc
-            self.sse[(cls, l)][:, c] += ((r - x) ** 2).sum(axis=(0, 2))
+        self.add_key((cls, l), x)
 
     def formats(self):
-        f = {(cls + "8", l): self.f8max[(cls, l)] + self.sse[(cls, l)].argmin(axis=1)
-             for (cls, l) in self.sse}
+        f = {(cls + "8", l): v for (cls, l), v in self.best().items()}
         f.update(self.base16)
         return f
 
@@ -795,17 +826,12 @@ class Model:
         it)."""
         s8 = i8spec()
         wq, fw = self.w[(l, key)]
-        K, N = wq.shape
+        K = wq.shape[0]
         if key == "lm" and self.i8_head_a16:              # W8A16: the int16 input as it is
-            e16 = int(np.asarray(self.Eh(ci, l, K)).min())
-            assert (self.Eh(ci, l, K) == e16).all(), "the W8A16 input has one exponent"
+            e16 = int(np.asarray(self.Ev(ci, l, K)).min())
+            assert (self.Ev(ci, l, K) == e16).all(), "the W8A16 input has one exponent"
             acc, g = s8.matmul_w8a16(np.rint(x * p2(e16)).astype(np.int64), e16, wq, fw, acc_bits=63)
-            acc = self.acc8(acc, co, l)
-            eo = self.Eh(co, l, N)
-            r = s8.requant(acc, g, eo, I16_LO, I16_HI)
-            self.stats.add(co, l, float(np.abs(acc * p2(-g)[None, :]).max()) if acc.size else 0.0,
-                           int(((r == I16_LO) | (r == I16_HI)).sum()), r.size)
-            return r / p2(eo)[None, :]
+            return self.out16(acc, g, co, l)
         if key == "o" and self.i8_oblk:
             # blocks at the base pvb: P.V wrote them (attn8_head; the values re-derive the same
             # MatMul exactly), or a 16-bit attention's int16 output rounds to them
@@ -813,22 +839,31 @@ class Model:
             if self.i8_attn:
                 xq, xd = s8.block_round_float(x, f8)
             else:
-                e16 = self.Eh(ci, l, K)
+                e16 = self.Ev(ci, l, K)
                 xq, xd = s8.block_round(np.rint(x * p2(e16)[None, :]).astype(np.int64), e16 - f8)
         elif key == "o" and self.i8_attn and ("pv8", l) in self.fmt:    # P.V wrote int8 (attn8_head)
             f8 = int(np.asarray(self.fmt[("pv8", l)]).flat[0])
             xq, xd = np.rint(x * p2(f8)).astype(np.int64), 0
         else:
-            e16 = self.Eh(ci, l, K)
+            e16 = self.Ev(ci, l, K)
             f8 = int(e16.min()) - 8
             if key == "o" and ("pv8", l) in self.fmt:       # a 16-bit P.V (i8lin): static at pv8
                 f8 = int(np.asarray(self.fmt[("pv8", l)]).flat[0])
             A = np.rint(x * p2(e16)[None, :]).astype(np.int64)
+            pad = (-K) % s8.BLOCK                          # K to whole blocks (SmolVLA's expert: 720)
+            if pad:
+                A, e16 = np.pad(A, ((0, 0), (0, pad))), np.pad(e16, (0, pad), mode="edge")
+                wq = np.pad(wq, ((0, pad), (0, 0)))
             xq, xd = s8.block_round(A, e16 - f8, dmax=0 if key == "o" else s8.DELTA_MAX)
         acc, g = s8.matmul(xq, f8, xd, wq, fw, acc_bits=63)
+        return self.out16(acc, g, co, l)
+
+    def out16(self, acc, g, co, l):
+        """An 8-bit kernel's accumulator (value acc * 2^-g) written as int16 at co's exponents:
+        the accumulator's wrap (acc8), rne, saturation; the value range in the statistics."""
         acc = self.acc8(acc, co, l)
-        eo = self.Eh(co, l, N)
-        r = s8.requant(acc, g, eo, I16_LO, I16_HI)
+        eo = self.Ev(co, l, acc.shape[-1])
+        r = i8spec().requant(acc, g, eo, I16_LO, I16_HI)
         self.stats.add(co, l, float(np.abs(acc * p2(-g)[None, :]).max()) if acc.size else 0.0,
                        int(((r == I16_LO) | (r == I16_HI)).sum()), r.size)
         return r / p2(eo)[None, :]
@@ -1364,6 +1399,30 @@ _MODS = {"i8": dict(i8=True),
          "rowops": dict(res_bits=15, inorm=True, isilu=True, irope="prefill"),
          "drope": dict(irope=True),
          "hprep": dict(irope=None)}
+
+
+I8_MODS = ("i8", "i8lin", "i8ob")
+
+
+def spec_with_mods(table, name, mods=I8_MODS):
+    """A policy dict from ``table`` (name -> dict or None): the entry, or the longest prefix
+    in the table followed by _MODS modifiers among ``mods`` (the vision / video / VLA studies'
+    8-bit modifiers)."""
+    if name in table:
+        return table[name]
+    parts = name.split("+")
+    for k in range(len(parts) - 1, 0, -1):
+        base = "+".join(parts[:k])
+        if table.get(base) is not None:
+            break
+    else:
+        raise KeyError(f"policy {name!r}: no known base")
+    pol = dict(table[base])
+    for mod in parts[k:]:
+        if mod not in mods:
+            raise KeyError(f"policy {name!r}: unknown modifier {mod!r}")
+        pol.update(_MODS[mod])
+    return pol
 
 
 def policy_spec(name):

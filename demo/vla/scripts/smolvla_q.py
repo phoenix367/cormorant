@@ -280,6 +280,10 @@ class Dec(ls.Model):
         self.gfin = g(prefix + "norm.weight")
         self.stats = ls.Stats(cfg.L)
         self.wsat = 0
+        self.i8 = self.q and bool(self.pol.get("i8"))     # the 8-bit kernels (doc/plans/INT8_PLAN.md §9.11)
+        self.i8_attn = self.i8 and self.pol.get("i8_attn", True)
+        self.i8_oblk = self.i8 and bool(self.pol.get("i8_oblk"))
+        self.i8cal = None                                  # an llm_study.I8Cal (i8_calibrators)
         self.io, self.w = {}, {}
         for l, keys in layers.items():
             for key in keys:
@@ -302,6 +306,8 @@ class Dec(ls.Model):
         ci, co = self.io[(l, key)]
         if not self.q:
             return self.fmm(x, self.w[(l, key)], co, l)
+        if self.i8:
+            return self.lin8(x, l, key, ci, co)
         n = self.w[(l, key)].shape[1]
         return self.kmm(x * p2(self.Ev(ci, l, x.shape[1])), self.w[(l, key)], self.Ev(co, l, n), 8, co, l)
 
@@ -336,11 +342,19 @@ class Dec(ls.Model):
                 e = np.exp(x - x.max(-1, keepdims=True))
                 out[:, h] = (e / np.cumsum(e, -1)[..., -1:]) @ V[g]
             return self.host(out.reshape(T, -1), "pv", l, self.E("pv", l))
+        if self.i8cal is not None:
+            self.i8cal.add("q", l, q)
+            self.i8cal.add("k", l, K.transpose(1, 0, 2))
+            self.i8cal.add("vc", l, V.transpose(1, 0, 2))
         if self.q:
             fq, fk, fs = self.Eh("q", l, cfg.H), self.Eh("k", l, cfg.KV), self.Eh("s", l, cfg.H)
             fp, fv, fpv = self.Eh("p", l, cfg.H), self.Ev("vc", l, cfg.KV * HD), self.Ev("pv", l, cfg.H * HD)
         for h in range(cfg.H):
             g = self.grp[h]
+            if self.i8_attn:                            # llm_study's 8-bit head (INT8_PLAN §6.3)
+                out[:, h] = self.attn8_head(q[:, h], K[g], V[g], mask, fq[h], fk[g], fs[h],
+                                            fv[g * HD:(g + 1) * HD], fpv[h * HD:(h + 1) * HD], l, True, h, g)
+                continue
             if not self.q:
                 s = self.fmm(q[:, h], K[g].T, "s", l, rec=False)
                 if self.record_ch and s.size:
@@ -352,6 +366,8 @@ class Dec(ls.Model):
             p = self.softmax(s, mask, fs[h], fp[h], l)
             out[:, h] = self.kmm(p * p2(fp[h]), V[g] * p2(fv[g * HD:(g + 1) * HD])[None, :],
                                  fpv[h * HD:(h + 1) * HD], 8, "pv", l)
+        if self.i8cal is not None:
+            self.i8cal.add("pv", l, out.reshape(T, 1, -1))
         return out.reshape(T, -1)
 
     def ibias(self, b):
@@ -382,6 +398,28 @@ class Dec(ls.Model):
             cols = fa0 == f
             y[:, cols] = ls.silu_table(int(f))[raw[:, cols] + 32768]
         return self.host(y, "at", L, self.Ev("at", L, y.shape[1]))
+
+
+def i8_calibrators(m, ch):
+    """The 8-bit calibration's pass 2 (llm_study.I8Cal) of a float SmolVLA (pol None) from the
+    float maxima ch {"vision", "text", "expert"}: set on the three models (their attention adds
+    the data); i8_formats then reads them."""
+    cfg = m.cfg
+    m.vision.i8cal = ls.I8Cal(ch["vision"], cfg.vision, final=(("xf", "xf"), ("xs", "xf")), src={"vc": "vc"})
+    m.text.i8cal = ls.I8Cal(ch["text"], cfg.text, final=())
+    m.expert.i8cal = ls.I8Cal(ch["expert"], cfg.expert, blocked=("x", "x2", "a", "kin", "vin"),
+                              final=(("xt", "xt"), ("at", "at"), ("xf", "xf")))
+
+
+def i8_formats(m):
+    """The 8-bit formats {"vision", "text", "expert"} from i8_calibrators' data.  The expert's
+    self layers read the VLM layer's caches: their K / V exponents are the VLM's (k8 / vc8)."""
+    out = {part: getattr(m, part).i8cal.formats() for part in ("vision", "text", "expert")}
+    for l in range(m.cfg.expert.L):
+        if m.cfg.self_layer(l):
+            for c in ("k8", "vc8"):
+                out["expert"][(c, l)] = out["text"][(c, l)]
+    return out
 
 
 def layer_keys(cfg, model):
@@ -685,10 +723,28 @@ POLICIES = {
 }
 
 
+def policy_spec(name):
+    """A POLICIES entry, or one followed by the 8-bit modifiers i8 / i8lin / i8ob applied to the
+    vision, text and expert parts (llm_study._MODS; doc/plans/INT8_PLAN.md §9.11)."""
+    if name in POLICIES:
+        return POLICIES[name]
+    base, *mods = name.split("+i8")
+    if base not in POLICIES or POLICIES[base] is None:
+        raise KeyError(f"policy {name!r}: no known base")
+    pol = {part: dict(p) for part, p in POLICIES[base].items()}
+    for mod in mods:
+        mod = "i8" + mod.lstrip("+")
+        if mod not in ls.I8_MODS:
+            raise KeyError(f"policy {name!r}: unknown modifier {mod!r}")
+        for part in pol:
+            pol[part].update(ls._MODS[mod])
+    return pol
+
+
 def part_policy(name, part):
     """One part (vision / text / expert) quantised by the policy name, the others float
     (ablation)."""
-    p = POLICIES[name]
+    p = policy_spec(name)
     return {k: (v if k in part else None) for k, v in p.items()}
 
 

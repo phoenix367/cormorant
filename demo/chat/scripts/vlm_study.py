@@ -352,6 +352,10 @@ class VisionModel(ls.Model):
         self.grp = np.arange(vc.H)
         self.stats = ls.Stats(vc.L)
         self.wsat = 0
+        self.i8 = self.q and bool(self.pol.get("i8"))     # the 8-bit kernels (doc/plans/INT8_PLAN.md §9.6)
+        self.i8_attn = self.i8 and self.pol.get("i8_attn", True)
+        self.i8_oblk = self.i8 and bool(self.pol.get("i8_oblk"))
+        self.i8cal = None                                  # an llm_study.I8Cal (vision_i8cal)
         g = lambda n: Wv[n].astype(np.float64)
         self.ln1 = [(g(f"{LV}{l}.layer_norm1.weight"), g(f"{LV}{l}.layer_norm1.bias")) for l in range(vc.L)]
         self.ln2 = [(g(f"{LV}{l}.layer_norm2.weight"), g(f"{LV}{l}.layer_norm2.bias")) for l in range(vc.L)]
@@ -383,7 +387,19 @@ class VisionModel(ls.Model):
         ci, co = self._io(key)
         if not self.q:
             return self.fmm(x, self.w[(l, key)], co, l)
+        if self.i8:
+            return self.pe8(x) if ci == "pix" else self.lin8(x, l, key, ci, co)
         return self.kmm(x * p2v(self.Ev(ci, l, x.shape[1])), self.w[(l, key)], self.E(co, l), 8, co, l)
+
+    def pe8(self, x):
+        """The patch embedding on the 8-bit kernels: the uint8 pixels as a static int8 tensor
+        with the -128 offset (exact; INT8_PLAN §6.4), the offset folded into the accumulator's
+        bias (int8_spec.offset_bias), int8 weights per output channel, int16 out."""
+        s8 = ls.i8spec()
+        wq, fw = self.w[(0, "pe")]
+        acc, g = s8.matmul(s8.to_offset(x.astype(np.int64)), 0, 0, wq, fw,
+                           bias_acc=s8.offset_bias(wq, 0), acc_bits=63)
+        return self.out16(acc, g, "pe", 0)
 
     def ibias(self, b):
         """A residual add's bias as the row-ops unit adds it (policy ...+rowops =
@@ -428,9 +444,9 @@ class VisionModel(ls.Model):
             y[:, cols] = gelu_table(int(e))[raw[:, cols] + 32768]
         return self.host(y, "a", l, self.E("a", l))
 
-    def softmax(self, s, mask, fs, fp, layer):
+    def softmax(self, s, mask, fs, fp, layer, unit=True):
         """llm_study.Model.softmax with the vision exp (sexp2_table) in the
-        emulation; every key valid."""
+        emulation; every key valid (``unit``: llm_study's flag, the same here)."""
         if not self.q or self.exact("s"):
             return super().softmax(s, mask, fs, fp, layer)
         raw = np.rint(s * p2(fs)).astype(np.int64)
@@ -478,6 +494,9 @@ class VisionModel(ls.Model):
         q = self.qkv(q0, self.b[(l, "q")], "q", l, self.heads_e("q", l), "q0")
         k = self.qkv(k0, self.b[(l, "k")], "k", l, self.heads_e("k", l), "k0")
         v = self.qkv(v0, self.b[(l, "v")], "vc", l, self.Ev("vc", l, vc.D), "v")
+        if self.i8cal is not None:
+            for cls, t in (("q", q), ("k", k), ("vc", v)):
+                self.i8cal.add(cls, l, t.reshape(N, H, HD))
         if self.q:
             fq, fk, fs = self.Eh("q", l, H), self.Eh("k", l, H), self.Eh("s", l, H)
             fp, fv, fpv = self.Eh("p", l, H), self.Ev("vc", l, vc.D), self.Ev("pv", l, vc.D)
@@ -490,9 +509,15 @@ class VisionModel(ls.Model):
                 p = self.softmax(s, mask, 0, 0, l)
                 out[:, sl] = self.fmm(p, v[:, sl], "pv", l, sl, vc.D)
                 continue
+            if self.i8_attn:                        # llm_study's 8-bit head (INT8_PLAN §6.3)
+                out[:, sl] = self.attn8_head(q[:, sl], k[:, sl], v[:, sl], mask, fq[h], fk[h], fs[h], fv[sl],
+                                             fpv[sl], l, True, h, h)
+                continue
             s = self.kmm(q[:, sl] * p2(fq[h]), (k[:, sl] * p2(fk[h])).T, fs[h], 8, "s", l)
             p = self.softmax(s, mask, fs[h], fp[h], l)
             out[:, sl] = self.kmm(p * p2(fp[h]), v[:, sl] * p2(fv[sl])[None, :], fpv[sl], 8, "pv", l)
+        if self.i8cal is not None:
+            self.i8cal.add("pv", l, out.reshape(N, 1, vc.D))
         return out
 
     def forward(self, pix):
@@ -526,6 +551,15 @@ class VisionModel(ls.Model):
             b = min(K, a + self.conn_k)
             if not self.q:
                 parts.append(self.fmm(xs[:, a:b], self.w[(L, "c")][a:b], "img", L))
+                continue
+            if self.i8:                             # int8 blocks from the post-LN's fine int16 grid
+                s8 = ls.i8spec()
+                wq, fw = self.w[(L, "c")]
+                e16 = self.Ev("xs", L, K)[a:b]
+                f8 = int(e16.min()) - 8
+                xq, xd = s8.block_round(np.rint(xs[:, a:b] * p2v(e16)[None, :]).astype(np.int64), e16 - f8)
+                acc, g = s8.matmul(xq, f8, xd, wq[a:b], fw, acc_bits=63)
+                parts.append(self.out16(acc, g, "img", L))
                 continue
             fin = self.Ev("xs", L, K)[a:b]
             parts.append(self.kmm(xs[:, a:b] * p2v(fin), self.w[(L, "c")][a:b], self.E("img", L), 8, "img", L))
@@ -707,6 +741,30 @@ VISION_VOP = "pow2+p12+vgelu"         # its formats, GELU on VectorOPKernel's ac
                                       # generates where the platform has the unit
 
 
+# 8-bit modifiers after a VPOLICIES name (llm_study's _MODS; doc/plans/INT8_PLAN.md §9.6): i8 the
+# 8-bit kernels (int8 weights per output channel, blocked int8 inputs, the 8-bit attention), i8lin
+# the attention at 16 bits, i8ob the o input blocked — e.g. "pow2+p12+vgelu+vsmx+rowops+i8ob"
+VMODS = ("i8", "i8lin", "i8ob")
+
+
+def vpolicy_spec(name):
+    """The vision policy dict of ``name``: a VPOLICIES entry, or the longest VPOLICIES prefix
+    followed by VMODS (llm_study.spec_with_mods)."""
+    return ls.spec_with_mods(VPOLICIES, name, VMODS)
+
+
+def vision_i8cal(Wv, KW, vc, scale, vch, images):
+    """Pass 2 of the 8-bit calibration (llm_study.I8Cal) over the calibration images: the
+    least-error static int8 exponents of q / k / V per head and of P.V's output (q8 / k8 / vc8 /
+    pv8, pvb), and the blocked inputs' fine int16 grid (x / x2 / a, the post-LN's xf and the
+    connector's xs)."""
+    m = VisionModel(Wv, KW, vc, scale)
+    m.i8cal = ls.I8Cal(vch, vc, final=(("xf", "xf"), ("xs", "xf")), src={"vc": "vc"})
+    for p in images:
+        m.forward(p)
+    return m.i8cal.formats()
+
+
 def vision_policy(activations: bool, softmax: bool = False, rowops: bool = False, iembed=None) -> str:
     """The vision policy the scheduler's `vision` entry computes: VISION_VOP on a
     VectorOPKernel with the activation unit, else VISION_SHIPPED (host GELU);
@@ -807,11 +865,13 @@ def run_combo(name, vm, tm, evals, prompts, pix, ref, max_new, log, held=None):
     return res
 
 
-def calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs, sinks=(False, True)):
+def calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs, sinks=(False, True), i8=False):
     """Float runs over the calibration images (and the WikiText text for the
     text model): (float text model, its position-0 sink model, vision channel
-    maxima, {sink: text channel maxima}).  The calibration answers are the
-    float model's greedy answers (CAL_MAX_NEW tokens), teacher-forced."""
+    maxima, {sink: text channel maxima}, the 8-bit formats).  The calibration
+    answers are the float model's greedy answers (CAL_MAX_NEW tokens),
+    teacher-forced.  ``i8``: the 8-bit calibration's second pass too
+    (llm_study.I8Cal), returned as {"vision": formats, "text": formats}; else {}."""
     vf = VisionModel(Wv, KW, vc, scale, record_ch=True)
     tf = TextModel(Wt, tc, None, cos_sin=cs)
     tf0 = TextModel(Wt, tc, None, cos_sin=cs, base=tf)          # the position-0 sink
@@ -826,7 +886,17 @@ def calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs, sinks=(
         ls.teacher_forced(cm, ctext_ids)
         tcal[sink] = cm.stats.ch
         del cm
-    return tf, tf0, vf.stats.ch, tcal
+    i8fmt = {}
+    if i8:
+        i8fmt["vision"] = vision_i8cal(Wv, KW, vc, scale, vf.stats.ch, [pix[i] for i, _ in calib])
+        cm = TextModel(Wt, tc, None, cos_sin=cs, base=tf, sink=True, sink_model=tf0)
+        cm.i8cal = ls.I8Cal(tcal[True], tc)
+        for p, a, f in zip(cal_prompts, cal_answers, cal_feats, strict=True):
+            teacher_forced(cm, np.concatenate([p, np.array(a, np.int64)]), f)
+        ls.teacher_forced(cm, ctext_ids)
+        i8fmt["text"] = cm.i8cal.formats()
+        del cm
+    return tf, tf0, vf.stats.ch, tcal, i8fmt
 
 
 def formats_json(fmt, pol, name):
@@ -847,8 +917,8 @@ def cmd_formats(args):
     _evals, calib, pix, ctext_ids, _held = build_data(assets, tok, True)
     cs = ls.rope_tables(tc, 2 * ls.CTX)
     tpol, vpol = ls.POLICIES[TEXT_FORMATS], VPOLICIES[VISION_SHIPPED]
-    tf, tf0, vch, tcal = calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs,
-                                   sinks=(bool(tpol.get("sink")),))
+    tf, tf0, vch, tcal, _ = calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs,
+                                      sinks=(bool(tpol.get("sink")),))
     tfmt = ls.make_formats(tpol, tcal[bool(tpol.get("sink"))], Wt, tc)
     out = formats_json(tfmt, tpol, TEXT_FORMATS)
     m = TextModel(Wt, tc, tpol, tfmt, cos_sin=cs, sink_model=tf0)
@@ -888,20 +958,25 @@ def cmd_study(args):
     log(f"study {time.strftime('%Y-%m-%d %H:%M:%S')}  eval {len(evals)} images, calibration {len(calib)} images "
         f"+ {len(ctext_ids)} WikiText tokens, max_new {max_new}, prompt tokens {len(prompts[0])}")
     cs = ls.rope_tables(tc, 2 * ls.CTX)
-    tf, tf0, vch, tcal = calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs)
+    combos = [tuple(c.split("/")) for c in args.combos.split(",")] if args.combos else COMBOS[1:]
+    i8 = any((vpolicy_spec(vp) or {}).get("i8") or (ls.policy_spec(tp) or {}).get("i8") for vp, tp in combos)
+    tf, tf0, vch, tcal, i8fmt = calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs, i8=i8)
     log(f"  calibration {time.time() - t0:.0f}s")
     vfmts, tfmts = {}, {}
     vfloat = VisionModel(Wv, KW, vc, scale)
     ref = run_combo("float", vfloat, tf, evals, prompts, pix, None, max_new, log, held)
     results = {"float": {k: v for k, v in ref.items() if k not in ("feats", "tf_top1", "tf_lp")}}
-    combos = [tuple(c.split("/")) for c in args.combos.split(",")] if args.combos else COMBOS[1:]
     for vp, tp in combos:
         name = combo_name((vp, tp))
-        vpol, tpol = VPOLICIES[vp], ls.POLICIES[tp]
+        vpol, tpol = vpolicy_spec(vp), ls.policy_spec(tp)
         if vp not in vfmts:
             vfmts[vp] = make_vformats(vpol, vch, KW, vc, scale)
+            if (vpol or {}).get("i8"):
+                vfmts[vp].update(i8fmt["vision"])
         if tp not in tfmts:
             tfmts[tp] = ls.make_formats(tpol, tcal[bool((tpol or {}).get("sink"))], Wt, tc)
+            if (tpol or {}).get("i8"):
+                tfmts[tp].update(i8fmt["text"])
         vm = vfloat if vpol is None else VisionModel(Wv, KW, vc, scale, vpol, vfmts[vp])
         tm = tf if tpol is None else TextModel(Wt, tc, tpol, tfmts[tp], cos_sin=cs, sink_model=tf0)
         r = run_combo(name, vm, tm, evals, prompts, pix, ref, max_new, log, held if tpol else None)
@@ -992,8 +1067,15 @@ def cmd_ablate(args):
     bases = args.base.split(",")
     if len(bases) > 1:                                  # compare whole policies
         print(f"vision policies, {len(ev)} images: feature error vs float")
+        i8fmt = None
         for b in bases:
-            vm = VisionModel(Wv, KW, vc, scale, VPOLICIES[b], make_vformats(VPOLICIES[b], vf.stats.ch, KW, vc, scale))
+            vpol = vpolicy_spec(b)
+            vfmt = make_vformats(vpol, vf.stats.ch, KW, vc, scale)
+            if vpol.get("i8"):
+                if i8fmt is None:
+                    i8fmt = vision_i8cal(Wv, KW, vc, scale, vf.stats.ch, [load_pixels(image_path(i)) for i in ids])
+                vfmt.update(i8fmt)
+            vm = VisionModel(Wv, KW, vc, scale, vpol, vfmt)
             f = feat_metrics([vm.forward(p) for p in pix], ref)
             print(f"  {b:24s} rel {f['rel_mean']:.4f} (max {f['rel_max']:.4f})  cos_min {f['cos_min']:.5f}"
                   f"  weights saturated {vm.wsat}", flush=True)

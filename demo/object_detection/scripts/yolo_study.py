@@ -16,6 +16,13 @@ route B; doc/plans/YOLO_PLAN.md §3).  Host only.
               fpga      the scheduler's simulation of the generated C
                         (what the board computes, bit for bit)
             -> assets/study/yolo_study.json
+  i8        COCO128 in the 8-bit configuration (doc/plans/INT8_PLAN.md §9.7):
+            float64 against the 8-bit emulation of the cut graph
+            (demo/image_classification/scripts/onnx_i8.py: --policies, e.g.
+            i8 every tensor static int8, i8b the Conv outputs only Convs read
+            in blocks of 32 channels; onnx_i8.policy_options), calibrated on
+            every 4th image
+            -> assets/study/yolo_i8_study[_TAG].json
 
 usage: inference-scheduler/.venv/bin/python demo/object_detection/scripts/yolo_study.py CMD
            [--images N] [--workers K]
@@ -223,13 +230,68 @@ def cmd_study(a) -> int:
     return 0
 
 
+def _map(items, heads_of):
+    """val.py's mAP of the head maps heads_of(i, x) over the letterboxed COCO128 items."""
+    rows = []
+    for i, (_im, lab, shape, r, pad, x) in enumerate(items):
+        lines = open(lab).read().splitlines() if os.path.exists(lab) else []
+        labels = yp.labels_xyxy(lines, shape)
+        d = yp.to_image(yp.nms(yp.decode(heads_of(i, x)), **VAL), r, pad, shape)
+        rows.append((yp.match(d, labels), d[:, 4], d[:, 5], labels[:, 0]))
+    return yp.evaluate(rows)
+
+
+def cmd_i8(a) -> int:
+    sys.path.insert(0, os.path.join(REPO, "demo", "image_classification", "scripts"))
+    import onnx_i8 as oi
+    t0 = time.time()
+    items = []
+    for im, lab in coco128()[:a.images or None]:
+        img = Image.open(im)
+        x, r, pad = yp.letterbox(img)
+        items.append((im, lab, img.size, r, pad, np.asarray(x, np.float64)))
+    g0 = oi.Graph(model_path(True))
+    inp = g0.inputs[0]
+    ref = [g0.run_float({inp: it[5][None]}) for it in items]
+    out = {"images": len(items), "calibration": "every 4th image", "onnx": a.onnx, "policies": {}}
+    res = {"float": _map(items, lambda i, x: ref[i])}
+    print(f"float  mAP@0.5 {res['float']['map50']:.4f}  mAP@0.5:0.95 {res['float']['map']:.4f}  "
+          f"({time.time() - t0:.0f} s)", flush=True)
+    g = g0
+    if a.onnx:                                      # a fine-tuned graph (yolo_qat.py): its own float too
+        g = oi.Graph(a.onnx)
+        own = [g.run_float({inp: it[5][None]}) for it in items]
+        res["float (fine-tuned)"] = _map(items, lambda i, x: own[i])
+        print(f"float (fine-tuned)  mAP@0.5 {res['float (fine-tuned)']['map50']:.4f}  "
+              f"mAP@0.5:0.95 {res['float (fine-tuned)']['map']:.4f}", flush=True)
+    cal = [{inp: it[5][None]} for it in items[::4]]
+    for pol in a.policies.split(","):
+        fm = oi.calibrate(g, cal, **oi.policy_options(pol))
+        heads = [g.run_i8({inp: it[5][None]}, fm) for it in items]
+        rel = [float(np.linalg.norm(h - f) / max(np.linalg.norm(f), 1e-12))
+               for hs, fs in zip(heads, ref, strict=True) for h, f in zip(hs, fs, strict=True)]
+        res[pol] = dict(_map(items, lambda i, x, heads=heads: heads[i]), head_rel_l2_mean=float(np.mean(rel)),
+                        head_rel_l2_max=float(np.max(rel)), formats={k: repr(v) for k, v in fm.items()})
+        print(f"{pol:6s} mAP@0.5 {res[pol]['map50']:.4f}  mAP@0.5:0.95 {res[pol]['map']:.4f}  head maps rel L2 "
+              f"mean {np.mean(rel) * 100:.2f} % max {np.max(rel) * 100:.2f} %  ({time.time() - t0:.0f} s)", flush=True)
+    out["policies"] = res
+    os.makedirs(os.path.join(ASSETS, "study"), exist_ok=True)
+    path = os.path.join(ASSETS, "study", f"yolo_i8_study{'_' + a.tag if a.tag else ''}.json")
+    json.dump(out, open(path, "w"), indent=1)
+    print(f"-> {path}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().split("\n\n")[0])
-    ap.add_argument("cmd", choices=("fetch", "validate", "study"))
+    ap.add_argument("cmd", choices=("fetch", "validate", "study", "i8"))
     ap.add_argument("--images", type=int, default=0, help="the first N COCO128 images (default: all)")
     ap.add_argument("--workers", type=int, default=6, help="study: simulation processes")
+    ap.add_argument("--policies", default="i8,i8b", help="i8: onnx_i8.policy_options names")
+    ap.add_argument("--tag", default="", help="i8: suffix of the results file")
+    ap.add_argument("--onnx", default=None, help="i8: the cut graph to judge (yolo_qat.py's output)")
     a = ap.parse_args(argv)
-    return {"fetch": cmd_fetch, "validate": cmd_validate, "study": cmd_study}[a.cmd](a)
+    return {"fetch": cmd_fetch, "validate": cmd_validate, "study": cmd_study, "i8": cmd_i8}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -242,6 +242,8 @@ class QM:
         self.cnt = defaultdict(int)
         self.accmax = defaultdict(float)
         self.wsat = 0
+        self.i8 = self.q and bool(self.pol.get("i8"))     # the 8-bit kernels (doc/plans/INT8_PLAN.md §9.8)
+        self.i8cal = None                                  # an llm_study.I8Sse: the 8-bit calibration's pass 2
         d = cfg["hidden_size"]
         self.d = d
         self.H = cfg["encoder_num_attention_heads"]
@@ -313,6 +315,9 @@ class QM:
         if not self.q:
             self.w[key] = Wt
             return
+        if self.i8:                                  # int8, a power-of-two exponent per output column
+            self.w[key] = ls.i8spec().encode_weights(Wt, axis=1)
+            return
         K, N = Wt.shape
         fi, fo = self.E(ci, scope, K), self.E(co, scope, N)
         sc = p2(fo + 8)[None, :] / p2(fi)[:, None]
@@ -367,6 +372,8 @@ class QM:
             y = x @ W
             self._rec(co, scope, y)
             return ls.bf16(y) if self.bf else y
+        if self.i8:
+            return self.kmm8(x, key, ci, co, scope)
         fi, fo = self.E(ci, scope, W.shape[0]), self.E(co, scope, W.shape[1])
         xr = rne(x * p2(fi))
         y = self._floor(xr @ W, fo, co)
@@ -384,6 +391,8 @@ class QM:
             if not self.q:
                 self._rec(co, scope, y)                 # calibrated with the bias in
             return ls.bf16(y) if self.bf else y
+        if self.i8:
+            return self.kmm8(x, key, ci, co, scope, bias)
         W = self.w[key]
         fi, fo = self.E(ci, scope, W.shape[0]), self.E(co, scope, W.shape[1])
         acc = rne(x * p2(fi)) @ W
@@ -392,6 +401,46 @@ class QM:
         r = np.clip(np.floor(acc / 256.0) + braw[None, :], I16_LO, I16_HI)
         self._count(co, r)
         return r / p2(fo)
+
+    def kmm8(self, x, key, ci, co, scope, bias=None):
+        """A kernel MatMul / conv on the 8-bit kernels (INT8_PLAN §6; int8_spec): int8 weights
+        per output channel; the input int8 in blocks of 32 rounded from its producer's int16 grid
+        (the classes' exponents E8 + 8, i8_formats) at the base min - 8; the o projections'
+        inputs static int8 at P.V's pv8 / cpv8 (a head of 36 / 52 channels: blocks of 32 would
+        straddle the heads ConvKernel writes one by one); the 16-bit audio through the W8A16
+        mode (conv1); the bias in the accumulator; rne + saturation to int16 at co."""
+        s8 = ls.i8spec()
+        wq, fw = self.w[key]
+        K = wq.shape[0]
+        if ci == "pcm":
+            acc, g = s8.matmul_w8a16(rne(x * 2.0 ** 15).astype(np.int64), 15, wq, fw, acc_bits=63)
+        else:
+            if ci in ("pv", "cpv"):
+                f8 = int(np.ravel(self.fmt[(ci + "8",) + tuple(scope)])[0])
+                xq, xd = rne(x * p2(f8)).astype(np.int64), 0
+            else:
+                e16 = self.E(ci, scope, K)
+                f8 = int(e16.min()) - 8
+                A = rne(x * p2(e16)[None, :]).astype(np.int64)
+                pad = (-K) % s8.BLOCK                  # K to whole blocks (the real models' are)
+                if pad:
+                    A, e16 = np.pad(A, ((0, 0), (0, pad))), np.pad(e16, (0, pad), mode="edge")
+                    wq = np.pad(wq, ((0, pad), (0, 0)))
+                xq, xd = s8.block_round(A, e16 - f8)
+            acc, g = s8.matmul(xq, f8, xd, wq, fw, acc_bits=63)
+        if bias is not None:
+            acc = acc + s8.bias_raw(bias, g)[None, :]
+        return self.out16(acc, g, co, scope)
+
+    def out16(self, acc, g, co, scope):
+        """An 8-bit kernel's accumulator (value acc * 2^-g) -> int16 at co's exponents."""
+        s8 = ls.i8spec()
+        lim = 2.0 ** (s8.ACC_BITS - 1)
+        self.accmax["acc8:" + co] = max(self.accmax["acc8:" + co], float(np.abs(acc).max()) / lim if acc.size else 0.0)
+        eo = self.E(co, scope, acc.shape[-1])
+        r = s8.requant(s8.wrap(acc), g, eo, I16_LO, I16_HI)
+        self._count(co, r)
+        return r / p2(eo)[None, :]
 
     def group_norm(self, t):
         """GroupNorm(1 group) of the tanh output t [t1][d] (raw int16 at 2^-15): the host
@@ -509,7 +558,7 @@ class QM:
         out[:, :, pm] = y / p2(fo)[None, :, None]
         return out.reshape(T, H * self.hd)
 
-    def softmax(self, s, fs, cls, scope):
+    def softmax(self, s, fs, cls, scope, fp=None):
         """One head's scores s [Tq, S] -> P at 2^-p_bits: the encoder's on VectorOPKernel's
         unit (vectorop_smx, column mode), a decoder step's on the host — LlmAttnSoftmax's
         p12 softmax: k = raw_max - raw, e = exp(-k 2^-f_s scale) (sexp_table), the sum
@@ -521,7 +570,7 @@ class QM:
             e = np.exp(x - x.max(-1, keepdims=True))
             P = e / e.sum(-1, keepdims=True)                   # (P's exponent is p_bits: not recorded)
             return ls.bf16(P) if self.bf else P
-        fp = int(self.pol.get("p_bits", 12))
+        fp = int(self.pol.get("p_bits", 12)) if fp is None else fp
         raw = np.rint(s * p2(fs)).astype(np.int64)
         if scope[0] == "e":
             cm, cs = ls.vsmx().scale_regs(int(fs), scale)
@@ -534,6 +583,12 @@ class QM:
 
     def attention(self, q, k, v, cls_q, cls_k, cls_v, cls_s, cls_p, cls_pv, scope, H):
         hd = self.hd
+        if self.i8:
+            return self.attention8(q, k, v, cls_q, cls_k, cls_v, cls_s, cls_p, cls_pv, scope, H)
+        if self.i8cal is not None:
+            T = q.shape[0]
+            for cls, t in ((cls_q, q), (cls_k, k), (cls_v, v)):
+                self.i8cal.add_key((cls + "8",) + tuple(scope), t.reshape(t.shape[0], H, hd))
         out = np.empty((q.shape[0], H * hd))
         fq, fk, fs = self.E(cls_q, scope, H), self.E(cls_k, scope, H), self.E(cls_s, scope, H)
         fv, fpv = self.E(cls_v, scope, H * hd), self.E(cls_pv, scope, H * hd)
@@ -547,6 +602,42 @@ class QM:
             out[:, sl] = self.amm(p, fp, v[:, sl], fv[sl], cls_pv, scope, fpv[sl])
         if not self.q:
             self._rec(cls_pv, scope, out)
+        if self.i8cal is not None:
+            self.i8cal.add_key((cls_pv + "8",) + tuple(scope), out.reshape(T, 1, H * hd))
+        return out
+
+    P8_BASE, P8_SRC = ls.Model.P8_BASE, ls.Model.P8_SRC     # P: int8 blocks of 32 keys at 2^-6 from 2^-14
+
+    def attention8(self, q, k, v, cls_q, cls_k, cls_v, cls_s, cls_p, cls_pv, scope, H):
+        """The 8-bit attention (INT8_PLAN §6.3, llm_study.Model.attn8_head): q, K, V int8 static
+        per head (q8 / k8 / vc8; cross: cq8 / ck8 / cv8), the scores at their int16 exponent,
+        P from the softmax at 2^-14 rounded to int8 blocks of 32 keys at base 2^-6, P.V written
+        int8 static at pv8 / cpv8 (the o projection's input)."""
+        s8 = ls.i8spec()
+        hd, sc = self.hd, tuple(scope)
+        f8 = {c: np.asarray(self.fmt[(c + "8",) + sc], np.int64).reshape(-1) for c in (cls_q, cls_k, cls_v, cls_pv)}
+        fs = self.E(cls_s, scope, H)
+        fo = int(f8[cls_pv][0])
+        S = k.shape[0]
+        pad = (-S) % s8.BLOCK
+        out = np.empty((q.shape[0], H * hd))
+        for h in range(H):
+            sl = slice(h * hd, (h + 1) * hd)
+            fq, fk, fv = int(f8[cls_q][h]), int(f8[cls_k][h]), int(f8[cls_v][h])
+            q8 = np.clip(rne(q[:, sl] * p2(fq)), s8.I8_LO, s8.I8_HI).astype(np.int64)
+            k8 = np.clip(rne(k[:, sl] * p2(fk)), s8.W8_LO, s8.W8_HI).astype(np.int64)
+            acc, g = s8.matmul(q8, fq, 0, k8.T, np.full(S, fk), acc_bits=63)
+            r = s8.requant(s8.wrap(acc), g, int(fs[h]), I16_LO, I16_HI)
+            self._count(cls_s, r)
+            s = r / p2(fs[h])
+            p = self.softmax(s, fs[h], cls_p, scope, fp=self.P8_SRC)
+            A = rne(np.pad(p, ((0, 0), (0, pad))) * 2.0 ** self.P8_SRC).astype(np.int64)
+            P8, Pd = s8.block_round(A, self.P8_SRC - self.P8_BASE)
+            v8 = np.clip(rne(v[:, sl] * p2(fv)), s8.W8_LO, s8.W8_HI).astype(np.int64)
+            acc, g = s8.matmul(P8, self.P8_BASE, Pd, np.pad(v8, ((0, pad), (0, 0))), np.full(hd, fv), acc_bits=63)
+            r = s8.requant(s8.wrap(acc), g, fo)
+            self._count(cls_pv, r)
+            out[:, sl] = r / p2(fo)
         return out
 
     # ---- encoder
@@ -758,6 +849,38 @@ def kernel_inputs(m):
     cons[("g2", "s", 0)].append((("s", 0, "c3"), 3))
     cons[("yf", "h", 0)].append((("h", 0, "lm"), 1))
     return cons
+
+
+# the static 8-bit operands (format class, the float calibration's class, int8 range low end):
+# q per head (the unpacked operand), K / V per head (the packed one: symmetric), P.V per tensor
+I8_STATIC = (("q", "q", -128), ("k", "k", -127), ("vc", "v", -127), ("pv", "pv", -128))
+I8_CROSS = (("cq", "cq", -128), ("ck", "ck", -127), ("cv", "cv", -127), ("cpv", "cpv", -128))
+
+
+def i8_calibrator(m, ch):
+    """The 8-bit calibration's pass 2 (llm_study.I8Sse) for a float QM: groups from the float
+    maxima ch; QM.attention adds the data when ``m.i8cal`` is set."""
+    sse = ls.I8Sse()
+    for part, n_l in (("e", m.L), ("d", m.Ld)):
+        nh = m.nheads((part, 0))
+        for l in range(n_l):
+            sc = (part, l)
+            for cls, src, lo in I8_STATIC + (I8_CROSS if part == "d" else ()):
+                n = 1 if cls in ("pv", "cpv") else nh
+                sse.group((cls + "8",) + sc, np.asarray(ch[(src,) + sc], np.float64).reshape(n, -1).max(1), lo, 127)
+    return sse
+
+
+def i8_formats(m, ch, sse):
+    """The 8-bit classes: the static operands' least-error exponents (sse) and the blocked kernel
+    inputs' int16 exponents E8 + 8 (E8 the int8 exponent of the calibration maximum: the producer
+    writes on a grid finer than any block's; llm_study.I8Cal)."""
+    s8 = ls.i8spec()
+    fmt = dict(sse.best())
+    for key in kernel_inputs(m):
+        if key in ch:
+            fmt[key] = s8.base_exponent(float(np.max(ch[key]))) + 8
+    return fmt
 
 
 def balanced(m_float, fmt, ch, ms, keys):

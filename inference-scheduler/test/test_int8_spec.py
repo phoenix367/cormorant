@@ -144,6 +144,44 @@ class TestBlockRule(unittest.TestCase):
         np.testing.assert_array_equal(qi, qf)
         np.testing.assert_array_equal(di, df)
 
+    @staticmethod
+    def _loop_shifts(r_of_d, nb_shape, block, dmax, lo, hi):
+        # the rule as defined: every shift in turn, the rounded block in [lo, hi]
+        d_best = np.zeros(nb_shape, np.int64)
+        for d in range(1, dmax + 1):
+            r = s8._blocks(r_of_d(d), block)
+            d_best = np.where((r.min(axis=-1) >= lo) & (r.max(axis=-1) <= hi), d, d_best)
+        return d_best
+
+    def test_one_pass_rule_equals_the_definition(self):
+        # block_round / block_round_float decide d from each block's extremes in one pass: the
+        # same d as rounding the block at every shift, at the rounding ties, with per-element
+        # shifts (some left), odd and even bounds, and past float64's integers (the loop)
+        rng = np.random.default_rng(17)
+        for case in range(40):
+            rows, nb = int(rng.integers(1, 5)), int(rng.integers(1, 6))
+            k = rng.integers(-2, 12, size=(1, nb * 32)) if case % 2 else int(rng.integers(0, 12))
+            kk = np.broadcast_to(np.asarray(k, np.int64), (rows, nb * 32))
+            A = (rng.normal(size=(rows, nb * 32)) * np.exp2(rng.integers(0, 22, size=(rows, nb, 1)))
+                 .repeat(32, 2).reshape(rows, nb * 32)).astype(np.int64)
+            for _ in range(8):                                    # ties: (hi + 1/2) 2^(k-d), (lo - 1/2) 2^(k-d)
+                i, j = int(rng.integers(rows)), int(rng.integers(nb * 32))
+                s = int(kk[i, j]) - int(rng.integers(1, 8))
+                if s >= 1:
+                    A[i, j] = int(rng.choice([255, -257, 253, -255])) << (s - 1)
+            lo, hi = [(-128, 127), (-127, 127), (-128, 126), (0, 255)][case % 4]
+            if case == 39:
+                A[0, 0] = 2 ** 60
+            q, d = s8.block_round(A, k, lo=lo, hi=hi)
+            ref = self._loop_shifts(lambda dd: s8.rne_shr(A, kk - dd), d.shape, 32, 7, lo, hi)  # noqa: B023
+            np.testing.assert_array_equal(d, ref)
+            np.testing.assert_array_equal(q, np.clip(s8.rne_shr(A, kk - np.repeat(ref, 32, -1)), lo, hi))
+            f = int(rng.integers(-3, 10))
+            x = A * 2.0 ** -(f + 12)
+            qf, df = s8.block_round_float(x, f, lo=lo, hi=hi)
+            reff = self._loop_shifts(lambda dd: s8.rne_float(x * 2.0 ** (f + dd)), df.shape, 32, 7, lo, hi)  # noqa: B023
+            np.testing.assert_array_equal(df, reff)
+
     def test_rule_is_idempotent_on_values(self):
         # a blocked tensor's values, rounded again by the rule, are the same values (the shift may
         # differ only where -128 * 2^-(f+d+1) = -64 * 2^-(f+d)): a consumer may re-derive blocks

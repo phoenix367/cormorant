@@ -444,6 +444,10 @@ POLICIES = {
             | {("a", "d"): 7, "g2": 6}},
     # every kernel input's exponent per channel from the error balance (moonshine_q.balanced)
     "unit+bal": {"p_bits": 12, "bal": True},
+    # the 8-bit configuration (doc/plans/INT8_PLAN.md §9.8; moonshine_q.QM.kmm8 / attention8): int8
+    # weights per output channel, blocked int8 kernel inputs, the 8-bit attention, conv1 W8A16
+    "opt+i8": {"p_bits": 12, "in_cap": 8, "caps": {c: 7 for c in ("x", "x2", "xf", "gn", "y", "y2", "y3", "yf")}
+               | {("a", "d"): 7, "g2": 6}, "i8": True},
     # ... except VectorOP's GELU outputs (Q8.8, so the GELUs stay on the FPGA)
     "unit+bal+vop": {"p_bits": 12, "bal": "novop"},
 }
@@ -554,6 +558,7 @@ def cmd_study(args):
         fids = [res["float"]["ids"][u] for u, _, _ in utts]
         ftexts = [res["float"]["texts"][u] for u, _, _ in utts]
         pols = pols[1:]
+    i8fmt = None
     for pname in pols:
         t0 = time.time()
         if pname.startswith("ablate:"):
@@ -564,6 +569,15 @@ def cmd_study(args):
         fmt_path = None
         if pol is not None and not pol.get("bf16"):
             fmt = mq.make_formats(mf, ch, pol, ms=cal["ms"])
+            if pol.get("i8"):
+                if i8fmt is None:                      # the 8-bit calibration's pass 2 (float, dev-clean)
+                    mf.i8cal = mq.i8_calibrator(mf, ch)
+                    for _, _, pcm in utterances(args.assets, "calibration"):
+                        mq.transcribe_long(mf, cfg, pcm)
+                    i8fmt = mq.i8_formats(mf, ch, mf.i8cal)
+                    mf.i8cal = None
+                    log(f"8-bit calibration [{time.time() - t0:.0f} s]")
+                fmt.update(i8fmt)
             fmt_path = os.path.join(out_dir, f"formats_{pname.replace(':', '_').replace('+', '_')}.pkl")
             pickle.dump({"fmt": fmt, "policy": pol}, open(fmt_path, "wb"))
         with _pool(name, pol, fmt_path, args.jobs) as p:

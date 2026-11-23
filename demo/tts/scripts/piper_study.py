@@ -301,6 +301,17 @@ POLICIES = {
     "opt+hc+fw": ("opt+fw", "opt+hc+fw"),
     "opt, int16 chains": ("opt-i16", "opt-i16"),
     "chunk spec (the library)": ("chunk", "chunk"),
+    # the 8-bit configuration (doc/plans/INT8_PLAN.md §9.12): opt with every conv on the 8-bit
+    # ConvKernel (piper_vits.kconv8); the host / VectorOP ops stay int16
+    "opt+i8": ("opt+i8", "opt+i8"),
+    "opt+i8 flow only": ("opt+i8", "opt"),
+    "opt+i8 decoder only": ("opt", "opt+i8"),
+    # ... the flow's convs in the W8A16 mode (int16 inputs, int8 weights; piper_vits.kconv8)
+    "opt+i8, flow w8a16": ("opt+w8a16", "opt+i8"),
+    # ... and decoder convs in the W8A16 mode (":" name prefixes): the waveform conv, the last stage
+    "opt+i8, flow + post w8a16": ("opt+w8a16", "opt+i8:dec.post"),
+    "opt+i8, flow + stage 2 + post w8a16": ("opt+w8a16", "opt+i8:dec.post,dec.up2,dec.rb2"),
+    "opt+i8, post w8a16": ("opt+i8", "opt+i8:dec.post"),
     "chunk spec + unit gate": ("chunk-gq", "chunk-gq"),     # rowops_spec.gate (RPU_PLAN §14.2)
 }
 
@@ -308,14 +319,17 @@ POLICIES = {
 def _quant(pv, kind, exp):
     if kind is None:
         return None
+    kind, _, a16 = kind.partition(":")              # int8: the convs in the W8A16 mode
     if kind == "bf16":
         return pv.Quant({}, bf16=True)
     if kind == "q88":
         return pv.Quant({}, default=8)
-    w = "float" if kind.endswith("+fw") else "int16"
+    w = ("float" if kind.endswith("+fw") else "int8" if kind.endswith("+i8")
+         else "w8a16" if kind.endswith("+w8a16") else "int16")
     if kind.startswith("pow2"):
         return pv.Quant({k: v for k, v in exp.items() if not k.endswith("#in")}, weights=w)
-    return pv.Quant(exp, weights=w, host_chain="i16" not in kind, dec_chain="+hc" in kind)
+    return pv.Quant(exp, weights=w, host_chain="i16" not in kind, dec_chain="+hc" in kind,
+                    a16=tuple(p for p in a16.split(",") if p))
 
 
 def cmd_study(a) -> int:
@@ -354,7 +368,8 @@ def cmd_study(a) -> int:
             peak = max([q.acc_peak for q in (Qf, Qd) if q is not None] + [0.0])
             rows[pol].append((snr, lsd, sat, peak, _pause_floor(ref, err)))
             if name in ("eval00", "eval10") and pol in ("bf16", "q88", "pow2", "opt", "opt+hc", "opt, int16 chains",
-                                                         "chunk spec (the library)", "chunk spec + unit gate"):
+                                                         "chunk spec (the library)", "chunk spec + unit gate",
+                                                         "opt+i8"):
                 tag = pol.split(" (")[0].replace("+", "_").replace(", ", "_").replace(" ", "_")
                 _write_wav(os.path.join(out_dir, f"{name}_{tag}.wav"), wav)
         print(f"  {name}: {len(ref) / pv.SR:4.2f} s  " + "  ".join(

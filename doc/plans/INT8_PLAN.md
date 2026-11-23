@@ -402,7 +402,8 @@ with the cost models.
      generalized.
    - On the GTX 1050 this covers models up to ~135M parameters.  Larger ones (360M,
      SmolVLM, Moonshine base) need teacher logits precomputed to disk or block-wise
-     distillation (§8).
+     distillation (§8; 360M done with the teacher's top 64 on disk and AdamW in host
+     RAM, §9.9).
 
 Against the alternatives:
 - **Static per-tensor power-of-two (Xilinx DPU).**  Simplest hardware, but it collapses
@@ -453,7 +454,10 @@ The block scheme costs the hardware two things:
    - block-wise distillation (EfficientQAT [27]);
    - or the CPU at ~17 s per 1 k tokens.
 
-**Not screened yet (phase 1):**
+   360M took the first route plus AdamW's state in host RAM and half the layers'
+   gradients a step (§9.9: 3.1 GiB peak, 4.6 h for 1000 steps, +0.72 %).
+
+**Not screened in phase 0** (screened in phase 1, §9.7, except Gemma 3):
 - BERT-base: the literature finds its FFN residual sensitive, but here the residual
   stays int32;
 - Moonshine, Piper (log-mel / audio quality), LightStereo-S (a regression output),
@@ -466,7 +470,7 @@ the cost models.
 
 ### 9.1 The integer specification (2026-11-23)
 
-`inference-scheduler/src/int8_spec.py` (test: `test/test_int8_spec.py`, 19 cases
+`inference-scheduler/src/int8_spec.py` (test: `test/test_int8_spec.py`, 22 cases
 against exact arithmetic) fixes the details §6 left open:
 - **Weights.**  `encode_weights`: round half to even, [−127, 127], per output
   channel the least-error exponent of three (the finest that does not clip, and two
@@ -474,7 +478,11 @@ against exact arithmetic) fixes the details §6 left open:
 - **Block rule.**  `block_round`: d = the largest shift in [0, 7] at which the
   block's rne values fit [−128, 127]; one rounding per element; none fits → d = 0,
   saturated.  For the hardware this means a compare of the block's maximum and
-  minimum per candidate shift.
+  minimum per candidate shift — and so does the spec: rne is monotone, so a block fits
+  where its extremes do, and `block_round` finds every block's d in one pass over the
+  tensor (bit-identical to rounding it at each shift, tested so; 11× faster on an
+  attention head's 2048 × 2048 P, which had made V-JEPA 2's 8-bit study 6× slower than
+  its int16 one).
 - **MatMul.**  `matmul`: block sums shifted by 7 − d into an accumulator at
   `f_x + 7 + f_w[n]`, two's complement over 40 bits.  The spec evaluates it exactly
   in float64 (|x · 2^(7−d)| < 2^14, partial sums < 2^53).  A static input takes any
@@ -640,6 +648,339 @@ not WikiText) the signal is mixed:
 
 The chat models' fine-tuning should therefore distill on chat-style text as well
 (float's own answers to prompts, LLM-QAT style), and be judged on answer quality.
+
+### 9.6 The other models: their 8-bit paths
+
+Every shipped model's study now has an 8-bit policy on `int8_spec`, with the LLM's
+rules (§9.2):
+- int8 weights per output channel;
+- a kernel's input int8 in blocks of 32 along the reduction axis, rounded from its
+  producer's int16 grid at the class's E₈ + 8, or static where the hardware writes it
+  so;
+- the attention per §6.3: q, K, V static per head at least-error exponents, P in
+  blocks of 32 keys;
+- a reduction axis that is not whole blocks padded to them (SmolVLA's expert, 720
+  wide; the tests' tiny models), as the kernels pad to their granules anyway;
+- outputs rne to int16 wherever a host op, a row op or VectorOP reads them;
+- the first layer reads the sensor's integers exactly: uint8 pixels as int8 with the
+  −128 offset (the vision encoders), 16-bit audio through the W8A16 mode (Moonshine's
+  conv1).
+
+| model | study script | the 8-bit path | policy |
+|---|---|---|---|
+| SmolLM2-360M | `llm_study.py` | §9.2 | `…+i8ob` |
+| SmolVLM-256M | `vlm_study.py` | the vision encoder: `VisionModel.pe8`, `Model.lin8`, `attn8_head`; `vision_i8cal` (`I8Cal` over the encoder, the connector's input blocked); `vpolicy_spec` | vision `…+rowops+i8ob`, text `…+drope+i8ob` |
+| V-JEPA 2 ViT-L | `vjepa2_q.py`, `vjepa2_study.py` | the vision path plus `VJEPA2.attend`; `i8_calibrator` over the encoder, the pooler and the cross layer (the classifier's input blocked), the errors summed from the worker processes | `…+rowops+i8ob` |
+| SmolVLA | `smolvla_q.py`, `vla_study.py` | `Dec.lin` → `lin8`, `attn_mask` → `attn8_head`; `i8_calibrators` / `i8_formats`: the expert's self layers read the VLM's caches, so they take its k8 / vc8 | `…+rowops+i8ob` |
+| Moonshine tiny / base | `moonshine_q.py`, `asr_study.py` | `QM.kmm8`, `attention8`, conv1 W8A16; the o input static (heads of 36 / 52 channels are not whole blocks); `i8_calibrator` / `i8_formats` | `opt+i8` |
+| BERT-base | `bert_study.py` | `Bert._gemm8` (blocks from the Q8.8 tensors at calibrated bases, the bias in the accumulator), `_attn8`; `i8_calibrate` on examples outside the evaluation set | `sched+vsmx+iln+i8` |
+| Piper | `piper_vits.py`, `piper_study.py` | `kconv8`: every flow / decoder conv on the 8-bit ConvKernel, its input in blocks of 32 channels; selected convs W8A16 (`Quant(a16=…)`) | `opt+i8` and variants |
+| LightStereo-S | `stereo_study.py` | `Num.conv8` (every conv, the stripes as one conv) | `pow2+i8` |
+| ResNet-18, MobileNet v1 / v2, LeNet, mnist-8, YOLOv5n | `demo/image_classification/scripts/onnx_i8.py` (new: the ONNX graph in float64 and on the 8-bit kernels), `cnn_i8_study.py` (new), `yolo_study.py i8` | below | `i8`, `i8b`, `i8ba`, `i8bc` |
+
+**The ONNX models** have no exponents today (the scheduler runs them at Q8.8), so the
+8-bit path calibrates its own (`onnx_i8.calibrate`): per tensor the least-error int8
+exponent over float runs, unsigned [0, 255] where the calibration saw no negative value
+(the −128 offset folded into the consumer's bias).  The tensors that must share an
+exponent (MaxPool, Resize, the views, a Concat's inputs and output) share it.  Relu /
+Clip fold into the Conv or Add before them; x · Sigmoid(x) is one SiLU.  The policies
+differ in which tensors are blocked (`policy_options`):
+- `i8`: every tensor static;
+- `i8b`: a Conv output that only Convs read is written in blocks (ConvKernel's drain);
+- `i8ba`: the same for any writer (VectorOP's SiLU / Add with a block maximum too);
+- `i8bc`: and a Concat that only Convs read is the host's copy, written in blocks;
+- modifiers `+a16` (a Conv output that only an activation reads stays int16) and `+in16`
+  (the input image int16, the first Conv in the W8A16 mode).
+
+Shared pieces in `llm_study.py`: `I8Sse` (the least-error search, which `I8Cal` now
+subclasses), `I8Cal(layers=, final_layer=, blocked=, final=, src=)`, `Model.out16`,
+`spec_with_mods` (the 8-bit modifiers after another study's policy table).
+
+Tests: `inference-scheduler/test/test_int8_cnn.py` (6: the evaluator equals
+onnxruntime; every kernel output of the 8-bit run equals the exact value of its
+operands rounded into its format, static and blocked) and `test_int8_models.py` (10:
+on the tests' tiny vision, V-JEPA 2, SmolVLA and Moonshine models, the formats cover
+every attention layer, the patch embedding and Moonshine's conv1 equal the spec, the
+8-bit model is close to float).
+
+### 9.7 The other models: results (no fine-tuning)
+
+Each model against its float reference and its shipped int16 policy, on the yardstick of
+its plan.  Runs of 2026-11-23 on the dev PC (scratch logs in
+`/mnt/data/cormorant_repro/tmp/claude_scratch/int8/logs/`).
+
+**Pass as they are:**
+
+| model | data | float | int16 (shipped) | 8-bit |
+|---|---|---|---|---|
+| ResNet-18 | 500 Imagenette val images, 1000-way top-1 | 73.40 % | — | `i8` 73.20 %, `i8b` **73.40 %** (agreement with float 96.6 / 95.6 %) |
+| LeNet | MNIST test, 9800 images | 97.38 % | 97.35 % (LENET_PLAN) | `i8b` **97.33 %** (agreement 99.8 %) |
+| mnist-8 | MNIST test, 9800 images | 98.89 % | — | `i8` **98.91 %** (agreement 99.97 %) |
+| Moonshine tiny | 200 LibriSpeech test-clean utterances, WER | 4.49 % | 4.58 % (`opt`) | `opt+i8` **4.60 %** (tf top-1 0.989 against 0.991; encoder output rel. 0.083 against 0.063) |
+| BERT-base (SQuAD 1.1) | 60 single-window dev examples, EM / F1 | 93.3 / 96.5 | 93.3 / 97.1 (`sched+vsmx+iln`), 59 / 60 spans as float's | `…+i8` **93.3 / 96.5**, 60 / 60 spans (mean max logit error 1.19 against 1.30) |
+| Moonshine base | the same, WER | 3.02 % | 2.93 % (`opt`), 180 / 200 transcripts as float's | `opt+i8` **2.96 %**, 181 / 200 (tf top-1 0.9967 against 0.9958; encoder output rel. 0.057 against 0.087) |
+| V-JEPA 2 ViT-L (SSv2) | 24 Something-Something v2 validation clips, 174-way top-1 / top-5 | 66.7 / 87.5 % | 66.7 % (`pow2+p12+vgelu+vsmx+rowops`), top-1 agreement 1.000 | `…+i8ob` **66.7 / 87.5 %**, top-1 agreement 1.000 (top-5 overlap 0.967 against 0.983; KL 0.0035 against 0.0020; logits rel. 0.054 against 0.034, encoder output 0.34 against 0.18) |
+
+V-JEPA 2's 8-bit run took 7234 s for the 24 clips (~800–1000 s a clip in a worker, beside
+the 360M fine-tuning; int16 ~400 s): the P rounding of 384 heads a clip still costs ~0.5 s
+each after §9.1's speed-up.  The encoder output's error doubles, but the attentive pooler
+averages it out (pooled row 0.078 against 0.045) and no clip's class moves.
+
+**Within the yardstick, with a visible cost:**
+
+- **SmolVLA** (24 evaluation samples, 3 cameras, 50-action chunks; the actions against
+  float with the same noise, normalised units, the first 6 dims):
+
+  | policy | mean \|d\| | first 10 | rel. | vision features rel. | MAE to the recorded actions |
+  |---|---:|---:|---:|---:|---:|
+  | float with another noise (the policy's own variability) | 0.405 | 0.228 | 0.660 | – | 0.676 |
+  | int16 `pow2+p12+vgelu+vsmx+rowops` | 0.027 | 0.013 | 0.040 | 0.053 | – |
+  | `…+i8ob` (vision, VLM and expert 8-bit) | 0.135 | 0.079 | 0.221 | 0.088 | 0.628 (float 0.655) |
+
+  The 8-bit chunk moves a third of what another noise draw moves it, and its error to the
+  recorded actions is float's; but it is 5× int16's deviation.
+- **SmolVLM-256M** (24 COCO images with prompts; answers teacher-forced on float's):
+
+  | vision / text | features rel. | answer top-1 | KL | identical answers |
+  |---|---:|---:|---:|---:|
+  | int16 / int16 | 0.055 | 0.971 | 0.0033 | 8 / 24 |
+  | `…+i8ob` / int16 | 0.094 | 0.956 | 0.0100 | 5 / 24 |
+  | int16 / `…+i8ob` | 0.055 | 0.914 | 0.0181 | 2 / 24 |
+  | `…+i8ob` / `…+i8ob` (everything 8-bit) | 0.094 | 0.905 | 0.0260 | 4 / 24 |
+
+  The text model's held-out ppl (one 1024-token WikiText window): float 12.221, int16
+  12.208, 8-bit text 12.475 (+2.1 %).
+  - The 8-bit vision encoder triples the answers' KL; its error is in the linears, not
+    the attention (the vision ablation: 0.105 with every operand 8-bit, 0.100 with the
+    attention at 16 bits, 0.098 with the o input blocked).
+  - The 8-bit text model costs more: SmolVLM's text model is SmolLM2-135M-sized, and
+    like 135M (§9.4–§9.5) it needs fine-tuning — `llm_qat.py` on its text weights, with
+    the image prompts' answers in the distillation text.
+
+**Need more than the plain scheme:**
+
+- **SmolLM2-360M** (12 held-out windows; float ppl 13.798): int16 13.848 (+0.36 %,
+  top-1 0.974, KL 0.0043, 9 / 12 answers identical); `…+drope+i8ob` (everything 8-bit)
+  **14.049 (+1.82 %)**, top-1 0.919, KL 0.020, 3 / 12 identical.  Like 135M before
+  fine-tuning (+1.65 %, §9.4), outside the +1.5 % gate.  Fine-tuned (§9.9: AdamW in
+  host RAM, the teacher's top 64 on disk, on the 4 GB GPU) it is **13.897 (+0.72 %)**,
+  inside the gate.
+
+- **YOLOv5n** (COCO128, 128 images, mAP@0.5:0.95; float 0.349, int16 0.343).  Every
+  YOLO conv feeds a SiLU, so `i8b` blocks nothing and every activation is static per
+  tensor: `i8` 0.327 (−2.2 points).  The ablation on 64 images (head maps' rel. L2
+  against float: a finer measure there than mAP):
+
+  | policy | mAP@0.5:0.95 (64 images, float 0.369) | head maps rel. L2 |
+  |---|---:|---:|
+  | `i8` | 0.344 | 5.30 % |
+  | `i8ba` (VectorOP's SiLU writes blocks) | 0.356 | 4.16 % |
+  | `i8bc` (+ the Concat copies) | 0.345 | 4.18 % |
+  | `i8+a16` (a Conv output into its SiLU at int16) | 0.342 | 4.57 % |
+  | `i8+in16` (the image exact) | 0.346 | 5.05 % |
+  | `i8ba+a16+in16` | 0.354 | 2.68 % |
+
+  All three together reach int16's head error (2.50 % on 128 images).  On the 128
+  images:
+
+  | policy | mAP@0.5:0.95 | head maps rel. L2 |
+  |---|---:|---:|
+  | float | 0.349 | – |
+  | int16 (the scheduler's simulation, YOLO_PLAN) | 0.343 | 2.50 % |
+  | `i8` | 0.327 | 5.6 % |
+  | `i8ba+a16+in16` | 0.335 | 2.67 % |
+  | `i8ba+a16` | 0.331 | 2.63 % |
+  | `i8ba+in16` | 0.339 | 5.43 % |
+
+  mAP on 128 images moves by ±0.4 point between variants of very different head error,
+  so the head maps' error is the better guide below 0.5 point.  The 8-bit variants
+  stay 0.5–1.5 points under float and up to 1 point under int16.  The
+  hardware this asks for: VectorOP's activation unit writing blocks (a block maximum
+  beside the softmax unit's), the SiLU fused into ConvKernel's drain or a 16-bit conv
+  output into it, and the input normalisation folded into the first conv (uint8 pixels
+  exact, as the vision encoders do).  The remaining gap is a case for fine-tuning
+  (§9.8).
+- **MobileNet v2** (500 Imagenette images; float 77.40 %): `i8` 78.40 %, `i8b` 76.20 %,
+  but with only 91.4 / 90.4 % agreement with float and the logits 23 / 21 % off: the
+  network is fragile at 8 bits.  Its projection convs and residual adds feed VectorOP's
+  ADD, so under `i8b` those tensors stay static per tensor, and their channels' ranges
+  differ widely.  The phase-0 screen, with every conv input in blocks, kept 78.70 against
+  78.80 (§3.4).  `i8bv` lets VectorOP read and write blocks (per-block pre-shifts of its
+  operands, the block-maximum writer YOLO needs too): 61 of the tensors blocked against
+  36, **78.00 %, agreement 94.4 %, logits 15 % off**; with the depthwise inputs per
+  channel and the image exact (`i8bv+dwc+in16`, as for the stereo backbone below) **77.80 %,
+  agreement 94.4 %, logits 13 % off**.
+- **MobileNet v1** (500 Imagenette images; float 81.00 %): `i8` 80.20 %, `i8b` 79.40 %,
+  agreement 90.0 / 88.4 %, logits 26 / 30 % off; `i8bv+dwc+in16` 80.20 %, agreement 90.6 %.
+  Traced tensor by tensor, the error grows steadily through the 27 convs (5 % after the
+  first block, 21 % at the 12th, 38 % at the last pointwise conv): the ReLU6 activations
+  span [0, 6] at a step of 2^-5 while most values are far smaller — this TF checkpoint is
+  the classic case for quantization-aware training (TF's own int8 MobileNet v1 is
+  trained so).  Fine-tuning both MobileNets with `onnx_qat.py` is queued.
+- **LightStereo-S** (the 15 Middlebury + 27 ETH3D pairs; EPE / bad-2 / pixels more than
+  1 px from float): float 0.633 px / 4.44 %; int16 `pow2+pc5` 0.627 / 4.36 % / 3.35 %;
+  `pow2+i8` **0.679 / 4.91 % / 4.81 %**.  ETH3D is unchanged (0.464 against 0.462 float);
+  Middlebury loses (1.065 against 0.941 float, 7.3 % of pixels off by more than 1 px
+  against 3.6 % for int16).
+  - **Where:** one stage at a time at 8 bits (`pow2+pc5+i8@<stage>`, every 3rd pair, 14
+    pairs; EPE float 0.509, int16 0.513, `pow2+i8` 0.592): the MobileNetV2 backbone alone
+    0.584, the FPN 0.514, the aggregation and the attention as int16 — the backbone
+    carries the whole loss.
+  - **Why, and the fix:** a depthwise conv sums one channel's taps, so blocks of 32
+    *channels* mix unrelated channels and a small one loses its precision.  Its input
+    static per channel instead (`dwc`; free in the hardware: each output channel reads
+    one input channel, so the exponent folds into its output shift, and the producer's
+    drain already shifts per channel), and the stem in the W8A16 mode (`stem16`: what
+    folding the normalisation into it gives, the uint8 pixels exact).  On the worst pair
+    (PianoL): float 1.163 px, int16 1.211, `pow2+i8` 1.279, `+dwc` 1.243,
+    `+dwc+stem16` **1.212**.
+  - **All 42 pairs with the fix** (`pow2+i8+dwc+stem16`): EPE 0.668, bad-2 4.80 %,
+    3.62 % of pixels more than 1 px from float (int16 3.35 %), and a mean distance from
+    float of **0.254 px — int16's exactly**.  So the 8-bit model is as faithful to float as
+    the int16 one; int16's EPE against the ground truth (0.627, under float's 0.633) is
+    luck in the direction of its error.  Middlebury 1.000 against int16's 0.968, ETH3D
+    0.483 against 0.438.  Fine-tuning would be the next lever (the study's model is torch
+    already).
+- **Piper** (11 sentences, against float with the same noise; the model's own
+  variability, another flow noise: log-mel distance 2.64 dB):
+
+  | policy | SNR mean / min (dB) | log-mel dist. (dB) | pause floor (dBFS) |
+  |---|---|---:|---:|
+  | int16 `opt` (shipped) | 22.5 / 11.3 | 0.19 | −67.5 |
+  | `opt+i8` (every conv 8-bit) | 16.0 / 4.9 | 0.88 | −61.9 |
+  | flow 8-bit, decoder int16 | 16.5 / 4.8 | 0.28 | −67.8 |
+  | flow int16, decoder 8-bit | 20.6 / 10.6 | 0.84 | −61.8 |
+  | flow W8A16, decoder 8-bit | 19.2 / 14.7 | 0.85 | −61.1 |
+  | flow W8A16, decoder 8-bit, the waveform conv (`dec.post`) W8A16 | 19.2 / 14.7 | 0.71 | −61.5 |
+  | flow W8A16, decoder 8-bit, the last stage and `dec.post` W8A16 | 19.3 / 14.7 | 0.44 | −62.7 |
+  | flow 8-bit, decoder 8-bit, `dec.post` W8A16 | 16.0 / 4.9 | 0.73 | −62.3 |
+
+  The flow's coupling layers carry the waveform's phase: at 8 bits their error lowers
+  the SNR, which W8A16 repairs.  The decoder's error is spectral: +0.65 dB log-mel and a
+  6 dB higher noise floor in pauses, still a third of the model's own variability.  The
+  last upsampling stage (~40 % of the decoder's MACs: 64 channels at 256× the frame
+  rate) at W8A16 halves it, at the cost of the packing there.  Whether the all-8-bit
+  decoder is audible is a listening test: `eval00` / `eval10` `_float`, `_opt` (int16)
+  and `_opt_i8` WAVs in `demo/tts/assets/piper-lessac-medium/study/`.
+
+### 9.8 YOLOv5n fine-tuned for the 8-bit kernels
+
+`demo/object_detection/scripts/yolo_qat.py` on `demo/image_classification/scripts/onnx_qat.py`
+(`Net`: an `onnx_i8` graph in torch; `distill`; `export`; also behind `cnn_i8_study.py
+qat` for the classifiers): the cut graph's forward the spec of an `onnx_i8` policy
+(`i8ba+a16+in16`), straight through:
+- every Conv's weights int8 per output channel (the spec's exponent of three, chosen at
+  every step);
+- each tensor at its calibrated format: the SiLU outputs only Convs read in blocks of
+  32 channels, the rest static per tensor, the Conv outputs into a SiLU and the image at
+  16 bits;
+- the formats from `onnx_i8.calibrate` on 32 of the training images, fixed while
+  training.
+
+Distillation from the float model: the mean squared difference of the sigmoids of the
+three head maps.  Unlabeled images: COCO val2017 (5000; none of COCO128's; the archive's
+SHA-256 `4f7e2ccb…ef82f05`), letterboxed to 640, random flips.  3000 steps of 4 images,
+Adam 2e-5, 50 warmup steps then cosine: 61 min on the GTX 1050 with the calibration on the loaded CPU (the forward checked
+against the emulator first: float equal, quantized 1.6–2 % apart, both 3.2 % from float).
+The fake-quantisation helpers are shared with `llm_qat.py` (`demo/chat/scripts/int8_fq.py`).
+
+Judged bit for bit by `yolo_study.py i8 --onnx` (the trained weights back in the ONNX
+graph, recalibrated on every 4th COCO128 image), all 128 images:
+
+| | mAP@0.5 | mAP@0.5:0.95 | head maps rel. L2 vs float |
+|---|---:|---:|---:|
+| float (the original) | 0.545 | 0.349 | – |
+| int16 (the shipped datapath) | 0.543 | 0.343 | 2.50 % |
+| 8-bit `i8ba+a16+in16`, original weights | 0.536 | 0.335 | 2.67 % |
+| **8-bit `i8ba+a16+in16`, fine-tuned** | **0.543** | **0.343** | **1.90 %** |
+| fine-tuned weights in float | 0.547 | 0.337 | – |
+
+**Result: fine-tuned, YOLOv5n at 8 bits equals the shipped int16 datapath** (mAP 0.3427
+against 0.3429, 0.6 point under float), with less error than int16 in its head maps.  The
+fine-tuned weights are worse in float: they are trained for the 8-bit forward, which is
+the one deployed.
+
+**The MobileNets** (`cnn_i8_study.py qat`: the same `onnx_qat`, the KL of the logits,
+Imagenette's training images outside the calibration ones with random flips, 2000 steps of
+16, Adam 1e-5, ~33 min each on the GTX 1050), policy `i8bv+dwc+in16`, 500 Imagenette
+validation images:
+
+| | top-1 | agreement with float | logits rel. |
+|---|---:|---:|---:|
+| MobileNet v1, float | 81.00 % | – | – |
+| MobileNet v1, 8-bit, original weights | 80.20 % | 90.6 % | 0.264 |
+| **MobileNet v1, 8-bit, fine-tuned** | **80.20 %** | **96.6 %** | **0.081** |
+| MobileNet v1, fine-tuned weights in float | 77.60 % | – | – |
+| MobileNet v2, float | 77.40 % | – | – |
+| MobileNet v2, 8-bit, original weights | 77.80 % | 94.4 % | 0.129 |
+| **MobileNet v2, 8-bit, fine-tuned** | **78.00 %** | **98.4 %** | **0.086** |
+| MobileNet v2, fine-tuned weights in float | 78.20 % | – | – |
+
+On 1500 validation images (150 a class): MobileNet v1 float 81.80 %, fine-tuned 8-bit
+**81.47 % (−0.33 point), agreement 96.0 %**; MobileNet v2 float 77.00 %, fine-tuned 8-bit
+**77.47 % (+0.47), agreement 97.7 %**.  Fine-tuning brings both MobileNets as close
+to float as ResNet-18 is without it (96.6 % agreement), and within the 0.5-point gate.
+
+### 9.9 SmolLM2-360M: fine-tuning on the 4 GB GPU
+
+135M's recipe (§9.5: student, teacher and AdamW on the GPU) needs ~5.2 GB for 360M: the
+fp32 weights 1.45 GB, the linears' gradients 1.26 GB, AdamW's two moments 2.5 GB.
+`llm_qat.py` gains:
+- `--topk K`: the teacher runs first, alone on the GPU, over every training window
+  (stored: the K most likely tokens' log-probabilities, 64 here, on the host) and the
+  evaluation windows' argmax; then it leaves, and the loss is the KL over those K,
+  renormalised;
+- `--groups 2`: every other layer trains in a step (half the gradients held);
+- `--optim adamw-cpu`: AdamW's state and master weights in host RAM, the step's gradients
+  copied down and the updated weights back;
+- with 128-token windows × 8 accumulations the peak is 3.1 GiB.
+
+A first run with Adafactor in place of AdamW (`--optim adafactor`: factored second
+moments, no momentum) fitted the GPU but **degraded the model**: evaluation ppl 13.73 →
+14.36 at step 250, agreement flat, while 135M's AdamW run improved by then (17.23 → 17.08,
+0.923 → 0.934).  The second run, with the host-RAM AdamW, degraded the same way (ppl
+14.41 at step 250), so the optimizer was not the cause: the loss was.  It renormalised the
+teacher over its 64 most likely tokens, so the student was trained to put all its mass
+there; that sharpens it — the argmax agreement stays, but the ground-truth tokens outside
+the teacher's top 64 lose probability, and the perplexity rises.  The loss is now the
+exact KL of the coarse distribution: the teacher's top 64 at their true probabilities and
+one bucket for the rest of the vocabulary.  The third run (AdamW in host RAM, the
+corrected loss, the teacher's top-k cached for reruns: 17 min of teacher, then ~16 s a
+step) improves from the start:
+
+| step | eval ppl (4 windows) | agreement with float |
+|---:|---:|---:|
+| 0 | 13.733 | 0.926 |
+| 100 | 13.620 | 0.936 |
+| 200 | 13.605 | 0.935 |
+| 300 | 13.621 | 0.938 |
+| 400 | 13.623 | 0.940 |
+| 500 | 13.611 | 0.938 |
+| 600 | 13.591 | 0.940 |
+| 700 | 13.641 | 0.938 |
+| 800 | 13.567 | 0.939 |
+| 900 | 13.584 | 0.935 |
+| 1000 | 13.640 | 0.938 |
+
+The gain comes in the first 100 steps; the 4-window evaluation then holds within its
+noise.  The 1000 steps took 4.6 h (~16 s a step alone, ~22 s beside V-JEPA 2's study).
+The step-1000 weights, judged bit for bit by `llm_study.py study` on the 12 windows
+(recalibrated on them), against the original float 13.798:
+
+| | ppl | Δ | top-1 held-out | KL held-out | top-1 / KL prompt set | identical answers |
+|---|---:|---:|---:|---:|---:|---:|
+| original, `…+drope+i8ob` (everything 8-bit) | 14.049 | +1.82 % | 0.919 | 0.020 | 0.935 / 0.016 | 3/12 |
+| **fine-tuned, `…+drope+i8ob`** | **13.897** | **+0.72 %** | **0.931** | **0.015** | **0.941 / 0.013** | **2/12** |
+| int16, deployed | 13.848 | +0.36 % | 0.974 | 0.0043 | – | 9/12 |
+
+The fine-tuned model's own float ppl is 13.791 (the original's 13.798), so here too
+fine-tuning recovered the quantization loss rather than moving the model; its top-1, KL
+and identical answers are against that float.  Unlike 135M's, the prompt set improved
+too (top-1 0.935 → 0.941, KL 0.016 → 0.013), though the training text was WikiText alone.
+
+**Result: with fine-tuning, SmolLM2-360M runs entirely at 8 bits within the gate, at
++0.72 % ppl** (135M: +0.83 %).  The judgement took 47 min, its 8-bit pass 36 min (4.1 h
+before §9.1's `block_round` speed-up).
 
 ## Sources
 
