@@ -971,6 +971,7 @@ The step-1000 weights, judged bit for bit by `llm_study.py study` on the 12 wind
 |---|---:|---:|---:|---:|---:|---:|
 | original, `…+drope+i8ob` (everything 8-bit) | 14.049 | +1.82 % | 0.919 | 0.020 | 0.935 / 0.016 | 3/12 |
 | **fine-tuned, `…+drope+i8ob`** | **13.897** | **+0.72 %** | **0.931** | **0.015** | **0.941 / 0.013** | **2/12** |
+| fine-tuned, `…+drope+i8ob+i8hw` (LM head W8A16) | 13.878 | +0.58 % | 0.936 | 0.013 | 0.945 / 0.012 | 5/12 |
 | int16, deployed | 13.848 | +0.36 % | 0.974 | 0.0043 | – | 9/12 |
 
 The fine-tuned model's own float ppl is 13.791 (the original's 13.798), so here too
@@ -979,8 +980,9 @@ and identical answers are against that float.  Unlike 135M's, the prompt set imp
 too (top-1 0.935 → 0.941, KL 0.016 → 0.013), though the training text was WikiText alone.
 
 **Result: with fine-tuning, SmolLM2-360M runs entirely at 8 bits within the gate, at
-+0.72 % ppl** (135M: +0.83 %).  The judgement took 47 min, its 8-bit pass 36 min (4.1 h
-before §9.1's `block_round` speed-up).
++0.72 % ppl** (135M: +0.83 %); with the head's input at 16 bits +0.58 % (135M: +0.63 %).
+The judgement took 47 min, its 8-bit pass 36 min (4.1 h before §9.1's `block_round`
+speed-up).
 
 ## Sources
 
